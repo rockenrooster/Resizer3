@@ -1,12 +1,12 @@
 # Resizer3
 
-Resizer3 is a Windows desktop batch image converter and resizer built with WinForms and .NET. It is meant for local, high-throughput image conversion with drag-and-drop input, folder recursion, parallel processing, configurable output quality, resize controls, and failed-file tracking.
+Resizer3 is a Windows desktop batch image converter and resizer built with WinForms and .NET 10. It is meant for local, high-throughput image conversion with drag-and-drop input, folder recursion, parallel processing, configurable output quality, resize controls, and failed-file tracking.
 
 ## Download
 
 Download the latest `Resizer3.exe` from [GitHub Releases](https://github.com/rockenrooster/Resizer3/releases/latest).
 
-Resizer3 is published as a Windows x64, framework-dependent executable. Install the matching .NET Desktop Runtime if Windows cannot launch it.
+Resizer3 is published as a Windows x64, framework-dependent executable (.NET 10). Install the matching .NET Desktop Runtime if Windows cannot launch it.
 
 ## Features
 
@@ -27,6 +27,12 @@ Resizer3 is published as a Windows x64, framework-dependent executable. Install 
 4. Select an output format.
 5. Adjust quality, resolution, max resolution, thread count, and WebP effort if needed.
 6. Click `Convert`.
+
+## Project Background
+
+I started this project in June 2020. My goal was to have a small, lightweight app that can convert and resize image files efficiently with today's modern multicore CPUs. Other tools are too slow, too bloated, or capped at low thread counts, like FastStone. This tool scales with your CPU core count and is configurable, so converting 40,000 image files with a 5950X, like my system, is much faster than other tools.
+
+I have been using this app myself for over 6 years now, and I think it's ready to share with the world. I only started using AI on my hobby projects in 2025, so it hasn't really affected this project much, but I will use AI, including Codex, to help out my workflow going forward since it's a huge time saver for me. Using AI, I am testing alternate versions of this app, ResizerRust and ResizerC, to see if more performance can be extracted by using different languages.
 
 ## Documentation
 
@@ -53,23 +59,6 @@ The build writes:
 - `artifacts/Resizer3.exe`
 - `artifacts/Resizer3.exe.sha256`
 
-## Release
-
-Releases are created from version tags in the format `vX.Y.Z.W`.
-
-To increment the fourth version component, build, commit, push, tag, and trigger the GitHub Actions release workflow:
-
-```powershell
-.\release.ps1
-```
-
-Optional overrides:
-
-```powershell
-.\release.ps1 -Version 3.1.6.8 -Message "Release v3.1.6.8"
-```
-
-The workflow builds `Resizer3.exe`, verifies its `FileVersion`, generates `Resizer3.exe.sha256`, and uploads both files to the GitHub Release.
 
 ## Updates
 
@@ -77,5 +66,3 @@ The in-app updater checks the latest public GitHub Release. A release must inclu
 
 - `Resizer3.exe`
 - `Resizer3.exe.sha256`
-
-The updater does not use GitHub tokens. Private GitHub Releases need a different distribution strategy.

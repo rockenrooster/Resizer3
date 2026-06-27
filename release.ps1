@@ -68,6 +68,26 @@ function Get-GeneratedCommitBody {
     "Changes:`n" + ($items -join "`n")
 }
 
+function Assert-UpdaterRepoConfig {
+    param([string]$Origin)
+
+    $servicePath = Join-Path $PSScriptRoot "GitHubReleaseUpdateService.cs"
+    $content = Get-Content $servicePath -Raw
+    if ($content -notmatch 'GitHubOwner\s*=\s*"([^"]+)"' -or [string]::IsNullOrWhiteSpace($matches[1])) {
+        throw "GitHubReleaseUpdateService.GitHubOwner must be set before releasing."
+    }
+    $owner = $matches[1]
+
+    if ($content -notmatch 'GitHubRepo\s*=\s*"([^"]+)"' -or [string]::IsNullOrWhiteSpace($matches[1])) {
+        throw "GitHubReleaseUpdateService.GitHubRepo must be set before releasing."
+    }
+    $repo = $matches[1]
+
+    if ($Origin -notmatch "[:/]$([regex]::Escape($owner))/$([regex]::Escape($repo))(?:\.git)?$") {
+        throw "Updater repo $owner/$repo does not match origin $Origin."
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = Get-DefaultReleaseVersion
 }
@@ -82,6 +102,7 @@ $origin = (git remote get-url origin).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) {
     throw "No git remote named origin is configured."
 }
+Assert-UpdaterRepoConfig $origin
 
 $null = git rev-parse -q --verify "refs/tags/$tag" 2>$null
 if ($LASTEXITCODE -eq 0) {
