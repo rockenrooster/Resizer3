@@ -1,6 +1,32 @@
 # Resizer3
 
-Resizer3 is a Windows desktop batch image converter and resizer. It is built with WinForms on .NET and is designed for high-throughput local image processing with drag-and-drop input, multi-threaded conversion, configurable output quality, resolution controls, progress statistics, and failed-file tracking.
+Resizer3 is a Windows desktop batch image converter and resizer built with WinForms and .NET. It is meant for local, high-throughput image conversion with drag-and-drop input, folder recursion, parallel processing, configurable output quality, resize controls, and failed-file tracking.
+
+## Download
+
+Download the latest `Resizer3.exe` from [GitHub Releases](https://github.com/rockenrooster/Resizer3/releases/latest).
+
+Resizer3 is published as a Windows x64, framework-dependent executable. Install the matching .NET Desktop Runtime if Windows cannot launch it.
+
+## Features
+
+- Batch convert files or folders with drag and drop.
+- Preserve folder layout for dropped folders.
+- Resize by percentage or cap output to 4K, 1440p, or 1080p.
+- Convert to `jpg`, `png`, `webp`, `bmp`, `gif`, `tiff`, or `ico`.
+- Read common image formats including JPEG, PNG, HEIC/HEIF, WebP, AVIF, JPEG XL, BMP, GIF, TIFF, and ICO.
+- Tune quality, WebP effort, and worker thread count.
+- Track progress, throughput, before/after size, and failed files.
+- Check GitHub Releases for updates from inside the app.
+
+## Quick Start
+
+1. Launch `Resizer3.exe`.
+2. Drag image files or folders onto the file list.
+3. Choose an output folder.
+4. Select an output format.
+5. Adjust quality, resolution, max resolution, thread count, and WebP effort if needed.
+6. Click `Convert`.
 
 ## Documentation
 
@@ -8,36 +34,48 @@ Resizer3 is a Windows desktop batch image converter and resizer. It is built wit
 - [User Guide](docs/USER_GUIDE.md)
 - [Development Notes](docs/DEVELOPMENT.md)
 
-## Quick Start
+## Build From Source
 
-1. Launch `Resizer3.exe`.
-2. Drag image files or folders onto the file list.
-3. Choose an output path.
-4. Select an output format.
-5. Adjust quality, resolution, max resolution, thread count, and WebP effort if needed.
-6. Click `Convert`.
+Prerequisites:
 
-## Build
+- Windows
+- .NET SDK 10.0.x
+- PowerShell
+
+Build a local release artifact:
 
 ```powershell
 .\build.ps1
 ```
 
-Release builds write `artifacts/Resizer3.exe` and `artifacts/Resizer3.exe.sha256`.
+The build writes:
 
-## Releases And Updates
+- `artifacts/Resizer3.exe`
+- `artifacts/Resizer3.exe.sha256`
 
-Updates come from the latest public GitHub Release. Release tags must use `vX.Y.Z.W`, and the release must include these assets:
+## Release
 
-- `Resizer3.exe`
-- `Resizer3.exe.sha256`
+Releases are created from version tags in the format `vX.Y.Z.W`.
 
-Pushing a matching version tag runs the GitHub Actions release workflow.
-
-To build, commit, push, tag, and trigger a release with the next fourth-component version:
+To increment the fourth version component, build, commit, push, tag, and trigger the GitHub Actions release workflow:
 
 ```powershell
 .\release.ps1
 ```
 
-If Windows opens `.ps1` files in an editor, double-click `release.cmd` instead. Use `-Version` or `-Message` only when you want to override the defaults.
+Optional overrides:
+
+```powershell
+.\release.ps1 -Version 3.1.6.8 -Message "Release v3.1.6.8"
+```
+
+The workflow builds `Resizer3.exe`, verifies its `FileVersion`, generates `Resizer3.exe.sha256`, and uploads both files to the GitHub Release.
+
+## Updates
+
+The in-app updater checks the latest public GitHub Release. A release must include:
+
+- `Resizer3.exe`
+- `Resizer3.exe.sha256`
+
+The updater does not use GitHub tokens. Private GitHub Releases need a different distribution strategy.
