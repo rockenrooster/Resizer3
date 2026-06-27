@@ -33,3 +33,11 @@ Updates come from the latest public GitHub Release. Release tags must use `vX.Y.
 - `Resizer3.exe.sha256`
 
 Pushing a matching version tag runs the GitHub Actions release workflow.
+
+To build, commit, push, tag, and trigger a release with the next fourth-component version:
+
+```powershell
+.\release.ps1
+```
+
+If Windows opens `.ps1` files in an editor, double-click `release.cmd` instead. Use `-Version` or `-Message` only when you want to override the defaults.

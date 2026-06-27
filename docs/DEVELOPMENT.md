@@ -225,11 +225,19 @@ Legacy `--update` with no extra arguments is still supported.
 
 ## Release Process
 
-1. Commit changes.
-2. Push `main`.
-3. Create a version tag, for example `v3.1.6.7`.
-4. Push the tag.
-5. GitHub Actions builds `artifacts/Resizer3.exe`, verifies its `FileVersion`, writes `artifacts/Resizer3.exe.sha256`, and creates the GitHub Release.
+Run:
+
+```powershell
+.\release.ps1
+```
+
+The script increments the fourth version component, builds locally, verifies the artifact version, commits pending changes with a generated file-change summary, pushes the current branch, creates tag `vX.Y.Z.W`, and pushes the tag. GitHub Actions then builds `artifacts/Resizer3.exe`, verifies its `FileVersion`, writes `artifacts/Resizer3.exe.sha256`, and creates the GitHub Release.
+
+Optional overrides:
+
+```powershell
+.\release.ps1 -Version 3.1.6.8 -Message "Release v3.1.6.8"
+```
 
 ## Maintenance Notes
 
