@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build release artifact
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v(\d+\.\d+\.\d+\.\d+)$') {
+            throw "Tag must match vX.Y.Z.W"
+          }
+
+          $version = $Matches[1]
+          ./build.ps1 -Version $version -NoIncrement
+
+          if (!(Test-Path artifacts/Resizer3.exe)) {
+            throw "artifacts/Resizer3.exe was not created"
+          }
+
+          $fileVersion = (Get-Item artifacts/Resizer3.exe).VersionInfo.FileVersion
+          if ([version]$fileVersion -ne [version]$version) {
+            throw "FileVersion $fileVersion does not match tag version $version"
+          }
+
+          $actualHash = (Get-FileHash artifacts/Resizer3.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = ((Get-Content artifacts/Resizer3.exe.sha256 -Raw) -split '\s+')[0].ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "SHA256 file does not match artifacts/Resizer3.exe"
+          }
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" artifacts/Resizer3.exe artifacts/Resizer3.exe.sha256 --verify-tag --generate-notes

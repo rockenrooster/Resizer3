@@ -1,0 +1,17 @@
+.vs/
+.vscode/
+bin/
+obj/
+artifacts/
+publish/
+
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.binlog
+build_log.txt
+*.log
+
+Resizer3.exe
+*.zip
