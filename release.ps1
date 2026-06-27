@@ -93,6 +93,8 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 
 $tag = "v$Version"
+Write-Host "Releasing $tag" -ForegroundColor Cyan
+
 $branch = (git branch --show-current).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($branch)) {
     throw "Could not determine the current branch."
@@ -129,6 +131,7 @@ $fileVersion = (Get-Item $artifactExe).VersionInfo.FileVersion
 if ([version]$fileVersion -ne [version]$Version) {
     throw "FileVersion $fileVersion does not match $Version."
 }
+Write-Host "Verified local artifact FileVersion $fileVersion for $tag" -ForegroundColor Cyan
 
 $badPattern = @(
     'dns' + '\.randalling',

@@ -52,8 +52,8 @@
     <DebugType>embedded</DebugType>
     <ApplicationIcon>Resizer1.ico</ApplicationIcon>
     <SignAssembly>True</SignAssembly>
-    <AssemblyVersion>3.1.6.10</AssemblyVersion>
-    <FileVersion>3.1.6.10</FileVersion>
+    <AssemblyVersion>3.1.6.12</AssemblyVersion>
+    <FileVersion>3.1.6.12</FileVersion>
     <PackageIcon>Resizer_ico (1).png</PackageIcon>
     <PlatformTarget>x64</PlatformTarget>
     <DelaySign>False</DelaySign>
