@@ -7,7 +7,6 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.Reflection;
 using System.Text;
-using System.Threading.Channels;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Runtime.InteropServices;
@@ -80,10 +79,11 @@ namespace Resizer3
             if (!string.IsNullOrEmpty(settings.MaxRes))
                 maxResComboBox.SelectedItem = settings.MaxRes;
             numericUpDownWebpEffort.Value = ClampNumeric(settings.WebpEffort, numericUpDownWebpEffort.Minimum, numericUpDownWebpEffort.Maximum);
+            numericUpDownPngCompression.Value = ClampNumeric(settings.PngCompression, numericUpDownPngCompression.Minimum, numericUpDownPngCompression.Maximum);
 
             this.Shown += Form1_Shown;
             AddRelativePathColumn();
-            UpdateWebpLibvipsOptionsVisibility();
+            UpdateFormatOptionsVisibility();
 
             // Remove Failed Files tab initially
             tabControl.TabPages.Remove(tabPageFailedFiles);
@@ -419,6 +419,7 @@ namespace Resizer3
                 bool useLibvips = formatLocal != "image/ico" && formatLocal != "image/bmp" && formatLocal != "image/gif";
                 bool webpLossless = quality == 100;
                 int webpEffort = Decimal.ToInt32(numericUpDownWebpEffort.Value);
+                int pngCompression = Decimal.ToInt32(numericUpDownPngCompression.Value);
 
                 // Capture max resolution dimensions on UI thread before spawning workers
                 var (maxWidth, maxHeight) = GetMaxResolutionDimensions();
@@ -442,65 +443,39 @@ namespace Resizer3
 
                 int requestedDegree = threads > 0 ? threads : Environment.ProcessorCount;
                 int maxDegree = Math.Max(1, Math.Min(requestedDegree, Math.Max(1, filteredRows.Count)));
-                ThreadPool.GetMinThreads(out int minWorker, out int minIO);
-                int desiredMinWorkers = Math.Min(maxDegree + 2, Math.Max(Environment.ProcessorCount * 2, 8));
-                if (minWorker < desiredMinWorkers)
-                {
-                    ThreadPool.SetMinThreads(desiredMinWorkers, minIO);
-                }
                 if (useLibvips)
                 {
-                    // Avoid oversubscription: let outer file-level parallelism drive throughput.
-                    NetVips.NetVips.Concurrency = 1;
+                    // Split cores between file-level workers and libvips' internal pool
+                    // so small batches of large files still saturate the CPU.
+                    NetVips.NetVips.Concurrency = Math.Max(1, Environment.ProcessorCount / maxDegree);
                 }
 
-                int channelCapacity = Math.Max(1, Math.Min(Math.Max(1, filteredRows.Count), maxDegree * 4));
-                var channel = Channel.CreateBounded<ConversionItem>(
-                    new BoundedChannelOptions(channelCapacity)
-                    {
-                        SingleWriter = true,
-                        SingleReader = false,
-                        FullMode = BoundedChannelFullMode.Wait
-                    });
-
-                // Start consumers
-                var consumers = Enumerable.Range(0, maxDegree).Select(_ => Task.Run(async () =>
+                // Workers run CPU-bound loops for the whole batch, so give them dedicated
+                // threads; Task.Run would hold thread-pool threads and ramp up slowly
+                // past the pool's minimum when high thread counts are requested.
+                int nextIndex = -1;
+                var consumers = Enumerable.Range(0, maxDegree).Select(_ => Task.Factory.StartNew(() =>
                 {
-                    await foreach (var item in channel.Reader.ReadAllAsync(cts.Token).ConfigureAwait(false))
+                    while (true)
                     {
-                        try
+                        cts.Token.ThrowIfCancellationRequested();
+                        int i = Interlocked.Increment(ref nextIndex);
+                        if (i >= filteredRows.Count)
+                            break;
+
+                        var item = filteredRows[i];
+                        if (useLibvips)
                         {
-                            if (useLibvips)
-                            {
-                                ProcessSingleFileLibvips(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, webpLossless, webpEffort, cts.Token);
-                            }
-                            else
-                            {
-                                ProcessSingleFile(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, cts.Token);
-                            }
+                            ProcessSingleFileLibvips(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, webpLossless, webpEffort, pngCompression, cts.Token);
                         }
-                        catch (OperationCanceledException) { break; }
-                    }
-                }, cts.Token)).ToArray();
-
-                var producer = Task.Run(async () =>
-                {
-                    try
-                    {
-                        foreach (var file in filteredRows)
+                        else
                         {
-                            cts.Token.ThrowIfCancellationRequested();
-                            await channel.Writer.WriteAsync(file, cts.Token).ConfigureAwait(false);
+                            ProcessSingleFile(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, cts.Token);
                         }
                     }
-                    catch (OperationCanceledException) { }
-                    finally
-                    {
-                        channel.Writer.TryComplete();
-                    }
-                }, cts.Token);
+                }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
 
-                await Task.WhenAll(consumers.Append(producer));
+                await Task.WhenAll(consumers);
 
                 sw.Stop();
                 // ensure final UI update and stop timer
@@ -807,15 +782,13 @@ namespace Resizer3
             }
         }
 
-        private void ProcessSingleFileLibvips(string inPath, string outPath, long inputSize, string formatLocal, int quality, decimal multiplier, int maxWidth, int maxHeight, bool webpLossless, int webpEffort, CancellationToken token)
+        private void ProcessSingleFileLibvips(string inPath, string outPath, long inputSize, string formatLocal, int quality, decimal multiplier, int maxWidth, int maxHeight, bool webpLossless, int webpEffort, int pngCompression, CancellationToken token)
         {
             if (string.IsNullOrEmpty(inPath))
                 return;
             token.ThrowIfCancellationRequested();
 
             string ext = GetFormatExtension(formatLocal).ToLowerInvariant();
-            NetVips.Image? processedImage = null;
-            bool disposeProcessed = false;
             try
             {
                 token.ThrowIfCancellationRequested();
@@ -831,32 +804,28 @@ namespace Resizer3
 
                 Interlocked.Add(ref processedInputBytes, inputSize);
 
-                // Load image header with NetVips - fast and avoids full decode
-                using var image = NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential);
-                int imgWidth = image.Width;
-                int imgHeight = image.Height;
+                // Header-only probe for dimensions - pixels are not decoded until pulled
+                int imgWidth, imgHeight;
+                using (var probe = NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential))
+                {
+                    imgWidth = probe.Width;
+                    imgHeight = probe.Height;
+                }
+
                 var (targetWidth, targetHeight) = CalculateTargetDimensions(imgWidth, imgHeight, multiplier, maxWidth, maxHeight);
 
-                // Resize only if needed (use ThumbnailImage for fast decode+resize; downscale-only)
-                if (targetWidth != imgWidth || targetHeight != imgHeight)
-                {
-                    token.ThrowIfCancellationRequested();
-                    processedImage = image.ThumbnailImage(
-                        targetWidth,
-                        height: targetHeight,
-                        size: Enums.Size.Down);
-                    disposeProcessed = true;
-                }
-                else
-                {
-                    processedImage = image;
-                }
+                token.ThrowIfCancellationRequested();
+                // File-based Thumbnail enables shrink-on-load (scaled JPEG/WebP decode,
+                // HEIF thumbnails); ThumbnailImage on an open image cannot use those.
+                using var processedImage = (targetWidth != imgWidth || targetHeight != imgHeight)
+                    ? NetVips.Image.Thumbnail(inPath, targetWidth, height: targetHeight, size: Enums.Size.Down)
+                    : NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential);
 
                 // Ensure output directory exists
                 EnsureOutputDirectory(outPath);
 
                 token.ThrowIfCancellationRequested();
-                switch (ext.ToLower())
+                switch (ext)
                 {
                     case "webp":
                         processedImage.Webpsave(outPath, q: quality, lossless: webpLossless, effort: webpEffort);
@@ -866,7 +835,7 @@ namespace Resizer3
                         processedImage.Jpegsave(outPath, q: quality);
                         break;
                     case "png":
-                        processedImage.Pngsave(outPath, compression: 9);
+                        processedImage.Pngsave(outPath, compression: pngCompression);
                         break;
                     case "bmp":
                         processedImage.WriteToFile(outPath);
@@ -903,11 +872,6 @@ namespace Resizer3
             catch (Exception ex)
             {
                 ReportFailure(inPath, $"libvips error: {ex.Message}");
-            }
-            finally
-            {
-                if (disposeProcessed)
-                    processedImage?.Dispose();
             }
         }
 
@@ -1104,7 +1068,8 @@ namespace Resizer3
                     Resolution = (decimal)numericUpDownRes.Value,
                     Format = comboBox1.SelectedItem as string,
                     MaxRes = maxResComboBox.SelectedItem as string,
-                    WebpEffort = Decimal.ToInt32(numericUpDownWebpEffort.Value)
+                    WebpEffort = Decimal.ToInt32(numericUpDownWebpEffort.Value),
+                    PngCompression = Decimal.ToInt32(numericUpDownPngCompression.Value)
                 };
                 _ = settings.TrySave();
             }
@@ -1216,7 +1181,7 @@ namespace Resizer3
             {
                 numericUpDownQuality.Enabled = true;
             }
-            UpdateWebpLibvipsOptionsVisibility();
+            UpdateFormatOptionsVisibility();
         }
 
         private void maxResComboBox_SelectedIndexChanged(object sender, EventArgs e)
@@ -1232,11 +1197,16 @@ namespace Resizer3
             }
         }
 
-        private void UpdateWebpLibvipsOptionsVisibility()
+        private void UpdateFormatOptionsVisibility()
         {
-            bool show = (comboBox1.SelectedItem?.ToString()?.ToLower() == "webp");
-            labelWebpEffort.Visible = show;
-            numericUpDownWebpEffort.Visible = show;
+            string selected = comboBox1.SelectedItem?.ToString()?.ToLower() ?? "";
+            bool showWebp = selected == "webp";
+            labelWebpEffort.Visible = showWebp;
+            numericUpDownWebpEffort.Visible = showWebp;
+            // PNG controls share the WebP effort slot; the formats are mutually exclusive.
+            bool showPng = selected == "png";
+            labelPngCompression.Visible = showPng;
+            numericUpDownPngCompression.Visible = showPng;
         }
 
         private static decimal ClampNumeric(int value, decimal min, decimal max)
@@ -1257,9 +1227,51 @@ namespace Resizer3
                 return false;
 
             byte[] jpegData;
+            int width, height, subsamp, colorspace;
             try
             {
-                jpegData = File.ReadAllBytes(inPath);
+                using var fs = new FileStream(inPath, FileMode.Open, FileAccess.Read, FileShare.Read, FileStreamBufferSize, FileOptions.SequentialScan);
+                long fileLength = fs.Length;
+                if (fileLength <= 0 || fileLength > int.MaxValue)
+                    return false;
+
+                // Parse the header from a small prefix (growing if SOF sits past large
+                // EXIF/ICC segments) so images that fall through to libvips are not
+                // fully read into memory twice.
+                int filled = (int)Math.Min(fileLength, 128 * 1024);
+                byte[] buffer = new byte[filled];
+                fs.ReadExactly(buffer, 0, filled);
+
+                while (!TurboJpegNative.TryGetHeader(buffer, filled, out width, out height, out subsamp, out colorspace))
+                {
+                    if (filled >= fileLength)
+                        return false;
+
+                    int grownLength = (int)Math.Min(fileLength, (long)filled * 16);
+                    byte[] grown = new byte[grownLength];
+                    Buffer.BlockCopy(buffer, 0, grown, 0, filled);
+                    fs.ReadExactly(grown, filled, grownLength - filled);
+                    buffer = grown;
+                    filled = grownLength;
+                }
+
+                bool noResize = maxWidth == int.MaxValue
+                    ? multiplier == 1m
+                    : (width <= maxWidth && height <= maxHeight);
+                if (!noResize)
+                    return false;
+
+                if (filled < fileLength)
+                {
+                    byte[] full = new byte[fileLength];
+                    Buffer.BlockCopy(buffer, 0, full, 0, filled);
+                    fs.ReadExactly(full, filled, (int)fileLength - filled);
+                    jpegData = full;
+                }
+                else
+                {
+                    jpegData = buffer;
+                }
             }
             catch
             {
@@ -1267,15 +1279,6 @@ namespace Resizer3
             }
 
             inputSize = jpegData.LongLength;
-
-            if (!TurboJpegNative.TryGetHeader(jpegData, out int width, out int height, out int subsamp, out int colorspace))
-                return false;
-
-            bool noResize = maxWidth == int.MaxValue
-                ? multiplier == 1m
-                : (width <= maxWidth && height <= maxHeight);
-            if (!noResize)
-                return false;
 
             byte[]? icc = JpegIcc.TryExtract(jpegData);
 
@@ -1403,7 +1406,7 @@ namespace Resizer3
                 return handle;
             }
 
-            internal static bool TryGetHeader(byte[] jpegData, out int width, out int height, out int subsamp, out int colorspace)
+            internal static bool TryGetHeader(byte[] jpegData, int length, out int width, out int height, out int subsamp, out int colorspace)
             {
                 width = 0;
                 height = 0;
@@ -1412,7 +1415,7 @@ namespace Resizer3
                 IntPtr handle = GetDecompressHandle();
                 if (handle == IntPtr.Zero)
                     return false;
-                return tjDecompressHeader3(handle, jpegData, jpegData.Length, out width, out height, out subsamp, out colorspace) == 0;
+                return tjDecompressHeader3(handle, jpegData, length, out width, out height, out subsamp, out colorspace) == 0;
             }
 
             internal static bool TryTranscode(byte[] jpegData, int width, int height, int subsamp, int colorspace, int quality, out byte[] output)

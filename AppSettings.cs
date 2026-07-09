@@ -11,6 +11,7 @@ namespace Resizer3
         public string? Format { get; set; }
         public string? MaxRes { get; set; } = "Off";
         public int WebpEffort { get; set; } = 2;
+        public int PngCompression { get; set; } = 6;
 
         private static string SettingsFilePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Resizer3", "settings.json");
 

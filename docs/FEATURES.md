@@ -41,6 +41,7 @@ The right pane contains controls and statistics:
 - Resolution percentage value.
 - Max resolution selector.
 - WebP compression effort value, visible only for WebP output.
+- PNG compression level value, visible only for PNG output.
 - Thread count.
 - `Optimized Settings`.
 - `Convert`.
@@ -179,7 +180,7 @@ The format selector currently exposes:
 | Format | Encoder behavior |
 | --- | --- |
 | `jpg` | Written with JPEG quality. Uses a TurboJPEG fast path in a narrow no-resize JPEG-to-JPEG case when available. |
-| `png` | Written as PNG. Quality control is disabled for this format. |
+| `png` | Written as PNG using the selectable PNG compression level. Quality control is disabled for this format. |
 | `webp` | Written as WebP. Uses quality and WebP compression effort. Quality `100` enables lossless WebP behavior. |
 | `bmp` | Written through the fallback processing path. Quality control is disabled. |
 | `gif` | Written through the fallback processing path. Quality control is disabled. |
@@ -288,6 +289,24 @@ Default:
 
 Higher effort can improve compression at the cost of more processing time. Lower effort can improve throughput at the cost of larger output files.
 
+## PNG Compression Level
+
+The PNG compression control is visible only when output format is `png`.
+
+Range:
+
+```text
+0-9
+```
+
+Default:
+
+```text
+6
+```
+
+This is the zlib compression level. It affects only file size and processing time, never pixel quality: higher levels produce slightly smaller files but take longer to write, and lower levels favor throughput.
+
 ## Threads
 
 The thread count controls how many worker tasks process files in parallel.
@@ -311,9 +330,8 @@ Practical guidance:
 
 Implementation notes:
 
-- The app uses a bounded channel to feed work to consumers.
-- The channel capacity is four times the worker count.
-- For libvips processing, internal libvips concurrency is set to `1` so file-level parallelism drives throughput.
+- Workers run on dedicated threads and pull files from the shared work list.
+- For libvips processing, internal libvips concurrency adapts to the worker count so large batches avoid oversubscription while small batches of large files still use the whole CPU.
 - The process priority is set below normal at startup.
 
 ## Conversion Lifecycle
@@ -440,7 +458,7 @@ Used for most output formats:
 This path:
 
 - Reads image dimensions using libvips.
-- Uses libvips thumbnail processing when resizing is needed.
+- Uses libvips file-based thumbnail processing when resizing is needed, which enables shrink-on-load (scaled JPEG/WebP decode and HEIF embedded thumbnails).
 - Writes with format-specific save methods.
 - Uses file-level parallelism controlled by the thread setting.
 
@@ -456,8 +474,8 @@ Used only when all of these are true:
 
 This path:
 
-- Reads the JPEG bytes.
-- Extracts header data.
+- Parses the JPEG header from a small prefix read, so files that need libvips processing are not fully read twice.
+- Reads the full JPEG bytes only once the fast path is known to apply.
 - Preserves ICC profile data when possible.
 - Transcodes with TurboJPEG.
 - Writes the output directly.
@@ -502,6 +520,7 @@ On app close, Resizer3 saves:
 - Format.
 - Max resolution.
 - WebP effort.
+- PNG compression level.
 
 Settings file:
 

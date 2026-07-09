@@ -73,6 +73,8 @@ namespace Resizer3
             labelMaxRes = new Label();
             labelWebpEffort = new Label();
             numericUpDownWebpEffort = new NumericUpDown();
+            labelPngCompression = new Label();
+            numericUpDownPngCompression = new NumericUpDown();
             optimizedButton = new Button();
             processingProgress = new ProgressBar();
             clearListButton = new Button();
@@ -89,6 +91,7 @@ namespace Resizer3
             splitContainer1.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDownRes).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDownWebpEffort).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDownPngCompression).BeginInit();
             SuspendLayout();
             // 
             // tabControl
@@ -414,6 +417,8 @@ namespace Resizer3
             splitContainer1.Panel2.Controls.Add(labelMaxRes);
             splitContainer1.Panel2.Controls.Add(labelWebpEffort);
             splitContainer1.Panel2.Controls.Add(numericUpDownWebpEffort);
+            splitContainer1.Panel2.Controls.Add(labelPngCompression);
+            splitContainer1.Panel2.Controls.Add(numericUpDownPngCompression);
             splitContainer1.Panel2.Controls.Add(optimizedButton);
             splitContainer1.Panel2.Controls.Add(numericUpDownThreads);
             splitContainer1.Panel2.Controls.Add(label4);
@@ -651,7 +656,30 @@ namespace Resizer3
             numericUpDownWebpEffort.Size = new Size(32, 23);
             numericUpDownWebpEffort.TabIndex = 35;
             numericUpDownWebpEffort.Value = new decimal(new int[] { 2, 0, 0, 0 });
-            // 
+            //
+            // labelPngCompression
+            //
+            labelPngCompression.Anchor = AnchorStyles.Bottom;
+            labelPngCompression.AutoSize = true;
+            labelPngCompression.Font = new Font("Segoe UI", 9F);
+            labelPngCompression.Location = new Point(4, 200);
+            labelPngCompression.Name = "labelPngCompression";
+            labelPngCompression.Size = new Size(107, 15);
+            labelPngCompression.TabIndex = 36;
+            labelPngCompression.Text = "PNG Compression:";
+            //
+            // numericUpDownPngCompression
+            //
+            numericUpDownPngCompression.Anchor = AnchorStyles.Bottom;
+            numericUpDownPngCompression.Location = new Point(114, 198);
+            numericUpDownPngCompression.Margin = new Padding(4, 3, 4, 3);
+            numericUpDownPngCompression.Maximum = new decimal(new int[] { 9, 0, 0, 0 });
+            numericUpDownPngCompression.MaximumSize = new Size(48, 0);
+            numericUpDownPngCompression.Name = "numericUpDownPngCompression";
+            numericUpDownPngCompression.Size = new Size(32, 23);
+            numericUpDownPngCompression.TabIndex = 37;
+            numericUpDownPngCompression.Value = new decimal(new int[] { 6, 0, 0, 0 });
+            //
             // optimizedButton
             // 
             optimizedButton.Anchor = AnchorStyles.Bottom;
@@ -703,6 +731,7 @@ namespace Resizer3
             splitContainer1.ResumeLayout(false);
             ((System.ComponentModel.ISupportInitialize)numericUpDownRes).EndInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDownWebpEffort).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDownPngCompression).EndInit();
             ResumeLayout(false);
 
         }
@@ -743,6 +772,8 @@ namespace Resizer3
         private System.Windows.Forms.Label labelMaxRes;
         private System.Windows.Forms.Label labelWebpEffort;
         private System.Windows.Forms.NumericUpDown numericUpDownWebpEffort;
+        private System.Windows.Forms.Label labelPngCompression;
+        private System.Windows.Forms.NumericUpDown numericUpDownPngCompression;
         private System.Windows.Forms.Button optimizedButton;
         private Label label10;
         private Label label8;

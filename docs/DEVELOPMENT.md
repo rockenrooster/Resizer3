@@ -98,6 +98,7 @@ Saved values:
 - `Format`
 - `MaxRes`
 - `WebpEffort`
+- `PngCompression`
 
 Settings load failure returns defaults. Settings save failure is logged and ignored so shutdown can continue.
 
@@ -131,12 +132,11 @@ High-level flow:
 4. Snapshot UI state into local variables.
 5. Collect valid input rows.
 6. Compute total input size.
-7. Create a bounded channel.
-8. Start consumer tasks based on the thread count.
-9. Queue files through a producer task.
-10. Process each file with either libvips or fallback logic.
-11. Update progress from a UI timer.
-12. Stop timers and restore buttons.
+7. Start dedicated worker threads (`TaskCreationOptions.LongRunning`) based on the thread count.
+8. Workers pull items from the shared list via an atomic index.
+9. Process each file with either libvips or fallback logic.
+10. Update progress from a UI timer.
+11. Stop timers and restore buttons.
 
 ## Processing Path Selection
 
@@ -154,12 +154,11 @@ Those formats use the fallback `ProcessSingleFile` path because libvips ICO writ
 
 The libvips path:
 
-- Uses `Image.NewFromFile` with sequential access.
-- Reads dimensions before deciding resize behavior.
+- Probes dimensions with a header-only `Image.NewFromFile` (sequential access).
 - Uses max-resolution caps or percentage scaling.
-- Uses `ThumbnailImage` only when dimensions need to change.
-- Writes with format-specific methods where possible.
-- Sets `NetVips.Concurrency = 1` to avoid nested oversubscription.
+- Uses the file-based `Image.Thumbnail` when dimensions need to change, which enables shrink-on-load (scaled JPEG/WebP decode, HEIF thumbnails).
+- Writes with format-specific methods where possible (PNG zlib level from the PNG Compression spinner, default 6).
+- Sets `NetVips.Concurrency = max(1, cores / worker count)` so large batches avoid nested oversubscription while small batches of large files still saturate the CPU.
 
 Format save methods:
 
@@ -173,6 +172,8 @@ Format save methods:
 ## TurboJPEG Fast Path Notes
 
 The TurboJPEG path is attempted only for no-resize JPEG-to-JPEG output.
+
+It parses the JPEG header from a small prefix read (growing as needed) so images that fall through to libvips are not fully read into memory twice.
 
 It is skipped when:
 
@@ -231,7 +232,9 @@ Run:
 .\release.ps1
 ```
 
-The script increments the fourth version component, builds locally, verifies the artifact version, commits pending changes with a generated file-change summary, pushes the current branch, creates tag `vX.Y.Z.W`, and pushes the tag. GitHub Actions then builds `artifacts/Resizer3.exe`, verifies its `FileVersion`, writes `artifacts/Resizer3.exe.sha256`, and creates the GitHub Release.
+The script increments the fourth version component, builds locally, verifies the artifact version, promotes the `Unreleased` section of `CHANGELOG.md` to a `## vX.Y.Z.W - date` section, commits pending changes with a generated file-change summary, pushes the current branch, creates tag `vX.Y.Z.W`, and pushes the tag. GitHub Actions then builds `artifacts/Resizer3.exe`, verifies its `FileVersion`, writes `artifacts/Resizer3.exe.sha256`, and creates the GitHub Release using that changelog section as the release notes (falling back to auto-generated notes when the changelog has no entry for the tag).
+
+Changelog convention: keep user-visible changes as bullets under `## Unreleased` in `CHANGELOG.md`. The placeholder line under `Unreleased` is ignored during promotion; if only the placeholder is present, the changelog is left untouched and the release uses auto-generated notes.
 
 Optional overrides:
 

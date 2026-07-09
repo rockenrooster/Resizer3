@@ -68,6 +68,33 @@ function Get-GeneratedCommitBody {
     "Changes:`n" + ($items -join "`n")
 }
 
+function Update-ChangelogForRelease {
+    param([string]$Tag)
+
+    $changelogPath = Join-Path $PSScriptRoot "CHANGELOG.md"
+    if (!(Test-Path $changelogPath)) {
+        return $false
+    }
+
+    $content = Get-Content $changelogPath -Raw
+    $match = [regex]::Match($content, '(?ms)^## Unreleased\s*?\r?\n(.*?)(?=^## |\z)')
+    if (!$match.Success) {
+        return $false
+    }
+
+    $placeholder = '- Add upcoming user-visible changes here before tagging a release.'
+    $entries = @(($match.Groups[1].Value -split '\r?\n') | Where-Object { $_.Trim() -and $_.Trim() -ne $placeholder })
+    if (!($entries | Where-Object { $_ -match '^\s*[-*] ' })) {
+        return $false
+    }
+
+    $date = Get-Date -Format 'yyyy-MM-dd'
+    $newBlock = "## Unreleased`n`n$placeholder`n`n## $Tag - $date`n`n" + ($entries -join "`n") + "`n`n"
+    $content = $content.Substring(0, $match.Index) + $newBlock + $content.Substring($match.Index + $match.Length)
+    Set-Content $changelogPath -Value $content -NoNewline
+    return $true
+}
+
 function Assert-UpdaterRepoConfig {
     param([string]$Origin)
 
@@ -148,6 +175,13 @@ if ($LASTEXITCODE -eq 0) {
 }
 if ($LASTEXITCODE -gt 1) {
     throw "Forbidden text scan failed."
+}
+
+if (Update-ChangelogForRelease $tag) {
+    Write-Host "Promoted CHANGELOG.md Unreleased notes to $tag" -ForegroundColor Cyan
+}
+else {
+    Write-Host "CHANGELOG.md has no Unreleased notes; GitHub release notes will be auto-generated." -ForegroundColor Yellow
 }
 
 RunGit add -A

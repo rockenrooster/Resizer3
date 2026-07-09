@@ -75,6 +75,14 @@ If some files fail:
 
 Click `Clear List` to remove both successful input rows and failed-file rows.
 
+## Tune PNG Compression
+
+When `Format` is `png`, a `PNG Compression` control appears (0-9, default 6).
+
+- Lower values write faster with slightly larger files.
+- Higher values write smaller files but take longer.
+- The setting never affects image quality, only file size and speed.
+
 ## Tune Threads
 
 The default thread count uses the processor count unless a saved value exists.
