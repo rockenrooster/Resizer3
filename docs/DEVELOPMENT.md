@@ -32,19 +32,21 @@ Important project settings:
 | `PhotoSauce.MagicScaler` | Fallback image processing, resizing, and encoding. |
 | `PhotoSauce.NativeCodecs.Libheif` | HEIF/HEIC codec support for MagicScaler. |
 | `PhotoSauce.NativeCodecs.Libjxl` | JPEG XL codec support for MagicScaler. |
-| `PhotoSauce.NativeCodecs.Libpng` | PNG native codec package reference. |
 | `PhotoSauce.NativeCodecs.Libwebp` | WebP codec support for MagicScaler. |
 | `NetVips` | Primary high-performance image loading/resizing/saving path. |
 | `NetVips.Native` | Native libvips binaries. |
-| `Costura.Fody` | Embeds managed dependencies for distribution. |
 | `turbojpeg.dll` | Native fast path for no-resize JPEG-to-JPEG conversion. |
+
+Single-file publishing bundles the managed and native dependencies, so no assembly-embedding weaver is used.
 
 ## Source File Responsibilities
 
 | File | Responsibility |
 | --- | --- |
 | `Program.cs` | App entry point, unhandled exception hooks, process priority, updater mode. |
-| `Form1.cs` | Main UI behavior, drag-and-drop, conversion pipeline, update check, settings save/load, progress updates. |
+| `Form1.cs` | Main UI behavior: drag-and-drop, virtual-mode file grids, starting and cancelling batches, worker threads, progress updates, update check, settings save/load. |
+| `ConversionPipeline.cs` | UI-free conversion code: input scanning (`InputCollector`), output path planning (`OutputPlanner`), and per-file processing (`ConversionWorker`) for the libvips, TurboJPEG and MagicScaler paths. |
+| `TurboJpeg.cs` | TurboJPEG bindings, the per-worker `TurboJpegSession`, and JPEG metadata segment handling. |
 | `GitHubReleaseUpdateService.cs` | GitHub Releases metadata lookup, update download, version check, and SHA256 verification. |
 | `Form1.Designer.cs` | WinForms generated control layout. |
 | `AppSettings.cs` | JSON settings model and persistence. |
@@ -115,10 +117,11 @@ Logged contexts include:
 - Application thread exceptions.
 - AppDomain unhandled exceptions.
 - Settings persistence failures.
-- Timer disposal failures during shutdown.
+- Dropped-item scanning and unexpected conversion errors.
 - Update check failures.
+- Updater copy and relaunch failures.
 
-Logging is intentionally best-effort. The logging code catches and ignores its own failures.
+Logging is intentionally best-effort and serialized by a lock. The logging code catches and ignores its own failures. Past 1 MB the log is renamed to `Resizer3.old.log`.
 
 ## Conversion Pipeline
 
@@ -126,17 +129,17 @@ The conversion pipeline begins in the `Convert` button handler.
 
 High-level flow:
 
-1. Prevent duplicate starts with `isProcessing`.
-2. Create a new `CancellationTokenSource`.
-3. Reset counters and timers.
-4. Snapshot UI state into local variables.
-5. Collect valid input rows.
-6. Compute total input size.
-7. Start dedicated worker threads (`TaskCreationOptions.LongRunning`) based on the thread count.
-8. Workers pull items from the shared list via an atomic index.
-9. Process each file with either libvips or fallback logic.
-10. Update progress from a UI timer.
-11. Stop timers and restore buttons.
+1. Prevent duplicate starts with `isProcessing` and check that the output path is fully qualified.
+2. Snapshot UI state into `ConversionOptions` and copy the input list.
+3. Create a new `CancellationTokenSource`, reset counters, and start the single 50 ms UI timer.
+4. Plan output paths off the UI thread with `OutputPlanner`: same-path outputs are rejected, clashing outputs get ` (2)`, ` (3)` suffixes.
+5. Start dedicated worker threads (`TaskCreationOptions.LongRunning`) based on the thread count, capped at the number of jobs.
+6. Each worker owns a `ConversionWorker` (and its TurboJPEG session) and pulls jobs via an atomic index, checking cancellation between files. When an output already exists, the worker compares file IDs (`FileIdentity`) with the job's input and any input of the same name, catching aliases such as mapped drives, `subst` drives and junctions that the planner's string comparison cannot see.
+7. Each output is written to `<name>.r3tmp.<ext>`, stamped with the source time, and moved over the final path when complete; failures delete the temporary file.
+8. Workers update `Interlocked` counters and queue failures in a `ConcurrentQueue`; the timer drains the queue into the failed grid every 250 ms.
+9. In `finally`, stop the timer, run a last UI update, and restore buttons.
+
+Both grids run in virtual mode. `inputFiles` and `failedFiles` in `Form1` are the source of truth; header clicks sort those lists.
 
 ## Processing Path Selection
 
@@ -154,9 +157,9 @@ Those formats use the fallback `ProcessSingleFile` path because libvips ICO writ
 
 The libvips path:
 
-- Probes dimensions with a header-only `Image.NewFromFile` (sequential access).
-- Uses max-resolution caps or percentage scaling.
-- Uses the file-based `Image.Thumbnail` when dimensions need to change, which enables shrink-on-load (scaled JPEG/WebP decode, HEIF thumbnails).
+- Probes dimensions and EXIF orientation with a header-only `Image.NewFromFile` (sequential access, `failOn: Truncated`).
+- Uses max-resolution caps or percentage scaling on the displayed size (width and height swapped for orientations 5-8).
+- Uses the file-based `Image.Thumbnail` when dimensions need to change, which enables shrink-on-load (scaled JPEG/WebP decode, HEIF thumbnails) and auto-rotates. Otherwise the probe image itself is saved.
 - Writes with format-specific methods where possible (PNG zlib level from the PNG Compression spinner, default 6).
 - Sets `NetVips.Concurrency = max(1, cores / worker count)` so large batches avoid nested oversubscription while small batches of large files still saturate the CPU.
 
@@ -173,29 +176,31 @@ Format save methods:
 
 The TurboJPEG path is attempted only for no-resize JPEG-to-JPEG output.
 
-It parses the JPEG header from a small prefix read (growing as needed) so images that fall through to libvips are not fully read into memory twice.
+It reads a 128 KB prefix, checks the JPEG SOI marker, and parses the header from the prefix (reading the rest only when SOF sits further in) so images that fall through to libvips are not fully read into memory twice.
 
 It is skipped when:
 
 - `turbojpeg.dll` is unavailable.
 - The selected output is not JPEG.
-- The input is not JPEG.
+- The input extension is not `.jpg`, `.jpeg` or `.jfif`, or the data does not start with a JPEG marker.
 - Percentage resize is requested.
-- Max-resolution logic would require downscaling.
+- Max-resolution logic would require downscaling the displayed (EXIF-rotated) size.
+- The image is CMYK/YCCK, the header claims more than about 536 megapixels, or TurboJPEG reports an error or warning (decodes use `TJFLAG_STOPONWARNING`; for example truncated data); libvips then handles or reports the file.
 
-When used, it attempts to preserve ICC profile chunks.
+RGB-coded JPEGs (no YCbCr transform) are decoded to RGB pixels instead of raw YUV planes, because re-encoding their raw planes as YCbCr would shift the colours.
+
+When used, it copies the source's APP1 EXIF/XMP, APP2 ICC and APP13 Photoshop/IPTC segments into the output after the encoder's JFIF header. Each worker's `TurboJpegSession` keeps its codec handles, input buffer and native scratch buffer between files, frees any buffer larger than 64 MB after the file that needed it, and frees everything on dispose. The TurboJPEG bindings declare C `unsigned long` as `uint`, which is 32-bit on Windows.
 
 ## Fallback Path Notes
 
 The fallback path:
 
-- Reads the input file into memory.
-- Uses GDI+ when possible for dimensions and EXIF metadata.
-- Uses MagicScaler or libvips for dimension fallback.
+- Configures the MagicScaler codecs (libjxl, libheif, libwebp) on first use.
+- Reads dimensions with `ImageFileInfo` (already in displayed orientation), falling back to libvips.
 - Builds `ProcessImageSettings`.
 - Writes ICO with the custom `SaveAsIco` method.
 - Writes other fallback formats with MagicScaler.
-- Applies EXIF Date Taken or source last-write timestamp to the output file.
+- Applies EXIF Date Taken (read with GDI+) or source last-write timestamp to the output file.
 
 ## Update Mechanism
 
@@ -218,9 +223,10 @@ The manual `Update` button downloads the selected release asset beside the curre
 Updater mode:
 
 1. Waits for the original process id to exit when provided.
-2. Copies the updated executable over the target executable with retries.
-3. Relaunches the target executable.
-4. Schedules best-effort cleanup of `Resizer3Updated.exe`.
+2. Copies the updated executable to `<target>.new`, then renames it over the target, each with retries (40 attempts, 250 ms apart).
+3. If either step keeps failing, deletes the staged copy, logs and shows the error; the target is still the old version.
+4. Relaunches the target executable.
+5. Schedules best-effort cleanup of `Resizer3Updated.exe`.
 
 Legacy `--update` with no extra arguments is still supported.
 
@@ -245,6 +251,8 @@ Optional overrides:
 ## Maintenance Notes
 
 - The form designer contains some initial combo box items, but the constructor clears and repopulates the actual format list at runtime.
-- AVIF output implementation is commented out and should not be documented as a live output feature.
-- The `Output Full Folder Structure` mode currently preserves the source extension in the output path.
+- AVIF output is not implemented and should not be documented as a live output feature.
+- Saved numeric settings are clamped to each control's range when loaded.
+- `AllowUnsafeBlocks` is enabled for the native buffers in `TurboJpeg.cs`.
+- `ConversionPipeline.cs` and `TurboJpeg.cs` do not reference WinForms controls, so they can be compiled into a test harness directly.
 - The repository includes generated `bin` and `obj` outputs in the workspace; avoid editing generated files directly.

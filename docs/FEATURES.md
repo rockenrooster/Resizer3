@@ -58,14 +58,15 @@ When files are dropped:
 
 - Each supported image file is added to the `All Files` tab.
 - Unsupported files are ignored.
-- The app stores the full file path internally.
-- The visible row shows the input file path.
+- Files already in the list are skipped, so dropping the same folder twice adds nothing.
+- The app stores the full file path and size internally; sizes are read once while scanning.
+- The visible row shows the input file path. The list is read-only; click the column header to sort it.
 
 When folders are dropped:
 
-- The folder is scanned recursively.
+- The folder is scanned recursively. Folders that cannot be read are skipped.
 - Supported image files in nested folders are added.
-- Each file also receives a hidden relative path.
+- Each file also records a relative path.
 - The relative path includes the top-level folder name that was dropped.
 
 Example:
@@ -88,7 +89,7 @@ The drag-and-drop filter accepts:
 
 | Extension | Notes |
 | --- | --- |
-| `.jpg`, `.jpeg` | Standard JPEG input. |
+| `.jpg`, `.jpeg`, `.jfif` | Standard JPEG input. |
 | `.png` | Standard PNG input. |
 | `.heic`, `.heif` | HEIF-family input through native codecs/libvips support. |
 | `.webp` | WebP input. |
@@ -96,7 +97,7 @@ The drag-and-drop filter accepts:
 | `.jxl` | JPEG XL input through native codecs/libvips support. |
 | `.bmp` | Bitmap input. |
 | `.gif` | GIF input. |
-| `.tiff` | TIFF input. |
+| `.tif`, `.tiff` | TIFF input. |
 | `.ico` | Icon input. |
 
 ## Output Path
@@ -114,6 +115,8 @@ Ways to manage the output path:
 - Double-click the output path field to open a folder browser.
 - Click `Open` to open the configured output path in Windows Explorer.
 - Leave the field as-is to use the saved or default output folder.
+
+The output path must be a full folder path, such as `C:\img` or `\\server\share\img`; `Convert` asks you to fix it otherwise.
 
 The output root is saved when the app closes.
 
@@ -158,20 +161,27 @@ This mode is used when `Output Full Folder Structure` is checked.
 Current behavior:
 
 - The app derives an output path from the full original input path.
-- The drive root is removed.
+- The drive root (or UNC `\\server\share` root) is removed.
 - Colons are removed.
 - The resulting path is placed under the output root.
-- The original filename and original extension are preserved in the output path.
+- The output extension is changed to the selected format.
 
 Example:
 
 ```text
 Input:       D:\Photos\Trip\image.heic
+Format:      jpg
 Output root: C:\img
-Output:      C:\img\Photos\Trip\image.heic
+Output:      C:\img\Photos\Trip\image.jpg
 ```
 
-Important: the selected encoder is still used, but the output path in this mode currently keeps the original extension. For example, selecting `jpg` can write JPEG data to a path ending in the source extension when this mode is enabled.
+### Output Safety Rules
+
+These rules apply in both modes:
+
+- An input file is never overwritten. If its output path is the input file itself, the file is skipped and listed in `Failed Files`. This also holds when the output folder reaches an input through another path, such as a mapped drive versus its UNC path, a `subst` drive, a junction, or a symbolic link; files are compared by identity when an output already exists.
+- If two files in a batch map to the same output path, or an output path is another input file, the later file gets a numbered suffix: `image.webp`, `image (2).webp`, `image (3).webp`, in list order.
+- Each output is written to a temporary `<name>.r3tmp.<ext>` file in the same folder and renamed over the final path only when it is complete. A failed conversion deletes its temporary file, an interrupted one can leave only the temporary file behind, and neither damages an existing output.
 
 ## Output Formats
 
@@ -179,7 +189,7 @@ The format selector currently exposes:
 
 | Format | Encoder behavior |
 | --- | --- |
-| `jpg` | Written with JPEG quality. Uses a TurboJPEG fast path in a narrow no-resize JPEG-to-JPEG case when available. |
+| `jpg` | Written with JPEG quality. Uses a TurboJPEG fast path for no-resize JPEG-to-JPEG conversion when available; metadata is kept either way. |
 | `png` | Written as PNG using the selectable PNG compression level. Quality control is disabled for this format. |
 | `webp` | Written as WebP. Uses quality and WebP compression effort. Quality `100` enables lossless WebP behavior. |
 | `bmp` | Written through the fallback processing path. Quality control is disabled. |
@@ -187,7 +197,7 @@ The format selector currently exposes:
 | `tiff` | Written as TIFF. Quality control is disabled. |
 | `ico` | Written as a 256x256, 32-bit icon. Quality control is disabled. |
 
-AVIF output code exists only as commented-out implementation and is not available in the UI.
+AVIF output is not available.
 
 ## Quality
 
@@ -237,6 +247,8 @@ Examples:
 
 The resolution control is disabled whenever `Max Res` is not `Off`.
 
+Sizes refer to the image as displayed: for a photo whose EXIF orientation rotates it by 90 degrees, width and height are taken after rotation, and the output pixels are rotated upright.
+
 ## Max Resolution
 
 `Max Res` caps image dimensions without enlarging images that are already inside the selected bounds.
@@ -256,6 +268,7 @@ Behavior:
 - If the image exceeds either dimension, it is scaled down proportionally.
 - Aspect ratio is preserved.
 - The app uses the smaller of the width and height ratios to keep both dimensions inside the cap.
+- The cap is checked against the displayed orientation, so an EXIF-rotated portrait photo is treated as portrait.
 
 ## Optimized Settings
 
@@ -340,14 +353,15 @@ Clicking `Convert` starts a batch.
 
 The app then:
 
-1. Disables the `Convert` button.
-2. Enables `Cancel`.
-3. Reads the current UI settings into local variables.
-4. Filters the grid to existing files.
-5. Computes total input size for progress and saved percentage.
-6. Starts worker tasks.
-7. Updates the UI on timers while processing.
-8. Restores the `Convert` button after completion or cancellation.
+1. Checks that the output path is a full folder path.
+2. Disables `Convert` and `Update`, and enables `Cancel`.
+3. Reads the current UI settings and the file list into a snapshot.
+4. Plans every output path, applying the output safety rules.
+5. Starts worker threads.
+6. Updates the UI on a timer while processing.
+7. Restores the buttons after completion, cancellation, or an error.
+
+Files that no longer exist are reported in `Failed Files`.
 
 The button text changes during conversion:
 
@@ -370,7 +384,9 @@ Current behavior:
 - A cancellation message is shown when the processing task observes cancellation.
 - Already written files are left in the output folder.
 
-Cancellation is cooperative. A file that is already inside a native encoder call may finish before the worker exits.
+Cancellation is cooperative. A file that is already inside a native encoder call may finish before the worker exits. Because outputs are renamed into place only when complete, cancellation never leaves a half-written output.
+
+Closing the window during a conversion asks whether to stop it. Choosing `Yes` cancels the batch and closes the app once the files in progress finish; choosing `No` keeps converting. If a file is stuck, for example on a disconnected network drive, closing the window again offers to exit right away; files still in progress are then not saved.
 
 ## Progress And Statistics
 
@@ -381,16 +397,16 @@ Displayed values:
 | Label | Meaning |
 | --- | --- |
 | `Number of Files` | Number of rows in the input grid. |
-| `Completed Files` | Number of files successfully completed in the current batch. |
+| `Completed Files` | Number of files successfully completed in the current batch, followed by the failed count when any file failed. |
 | `Before Size` | Total size of listed input files. |
 | `After Size` | Total size of successfully written outputs. |
-| `Saved` | Percentage reduction based on before size versus after size. |
+| `Saved` | Percentage reduction of the written outputs versus the inputs that produced them. |
 | `Elapsed Time` | Time since conversion started. |
 | `files/s` | Completed files per elapsed second. |
 | `MB/s` | Input bytes processed per elapsed second. |
-| Progress bar | Completed files divided by total processing files. |
+| Progress bar | Processed files (completed plus failed) divided by the files in the batch. |
 
-File size calculations are done off the UI thread where possible so large lists do not freeze the interface.
+File sizes are read once while scanning dropped items, so large lists do not freeze the interface. Elapsed time refreshes every 50 ms and the other values every 250 ms.
 
 ## Failed Files
 
@@ -399,8 +415,10 @@ Failures are recorded without stopping the entire batch.
 When a file fails:
 
 - The `Failed Files` tab is added if it is not already visible.
-- A row is added with file path and error message.
-- The app switches to the failed-file tab.
+- A row is added with file path and error message. Failures are added in batches with the progress refresh, so thousands of failures do not freeze the window.
+- The app switches to the failed-file tab the first time a file fails in a batch.
+
+Click a column header to sort the failed files by path or by error message.
 
 The failed-file grid contains:
 
@@ -434,12 +452,11 @@ Fallback processing path:
 - Tries to read EXIF `Date Taken` from property ID `36867`.
 - If EXIF date parsing fails or is unavailable, uses the source file last-write time.
 - Applies the selected timestamp to the output file.
-- Retries briefly if the output file is still busy.
 
-libvips processing path:
+libvips and TurboJPEG processing paths:
 
-- Uses the source file last-write time.
-- Applies that timestamp to the output file after writing.
+- Use the source file last-write time.
+- Apply that timestamp to the output file after writing.
 
 ## Performance Paths
 
@@ -457,8 +474,10 @@ Used for most output formats:
 
 This path:
 
-- Reads image dimensions using libvips.
-- Uses libvips file-based thumbnail processing when resizing is needed, which enables shrink-on-load (scaled JPEG/WebP decode and HEIF embedded thumbnails).
+- Reads image dimensions and EXIF orientation using libvips.
+- Uses libvips file-based thumbnail processing when resizing is needed, which enables shrink-on-load (scaled JPEG/WebP decode and HEIF embedded thumbnails) and rotates EXIF-oriented images upright.
+- Saves the probed image directly when no resize is needed, keeping its metadata and orientation tag.
+- Reports truncated input as a failure instead of writing an image with missing rows.
 - Writes with format-specific save methods.
 - Uses file-level parallelism controlled by the thread setting.
 
@@ -466,21 +485,20 @@ This path:
 
 Used only when all of these are true:
 
-- Input is JPEG.
+- Input has a `.jpg`, `.jpeg` or `.jfif` extension and starts with a JPEG marker.
 - Output is JPEG.
 - TurboJPEG native library is available.
 - No percentage resize is requested.
-- No max-resolution downscale is required.
+- No max-resolution downscale is required for the displayed (EXIF-rotated) size.
 
 This path:
 
 - Parses the JPEG header from a small prefix read, so files that need libvips processing are not fully read twice.
 - Reads the full JPEG bytes only once the fast path is known to apply.
-- Preserves ICC profile data when possible.
-- Transcodes with TurboJPEG.
-- Writes the output directly.
+- Transcodes with TurboJPEG, reusing each worker's codec handles and buffers across files.
+- Copies the source's EXIF, XMP, ICC and Photoshop/IPTC segments into the output, so orientation, date taken and GPS are kept.
 
-If the fast path cannot be used, the app falls back to the normal libvips JPEG path.
+If the fast path cannot be used, the app falls back to the normal libvips JPEG path. Corrupt or truncated JPEGs also fall back, and libvips reports them.
 
 ### MagicScaler/GDI Fallback Path
 
@@ -492,11 +510,11 @@ Used for formats where libvips output support is not used by the app:
 
 This path:
 
-- Reads the input into memory.
-- Uses GDI+ where possible for dimensions and EXIF metadata.
-- Falls back to MagicScaler/libvips dimension detection for less common input formats.
+- Reads dimensions with MagicScaler (already in displayed orientation), falling back to libvips for less common input formats.
+- Uses GDI+ for the EXIF `Date Taken` timestamp.
 - Uses MagicScaler encoder settings for output.
 - Uses custom ICO writing for icon output.
+- Configures the MagicScaler codecs the first time this path runs, not at startup.
 
 ## ICO Output
 
@@ -542,7 +560,7 @@ Log file:
 %LOCALAPPDATA%\Resizer3\Resizer3.log
 ```
 
-The logger is designed not to crash the application. If logging itself fails, the failure is ignored.
+The logger is designed not to crash the application. If logging itself fails, the failure is ignored. When the log passes 1 MB it is renamed to `Resizer3.old.log` and a new log starts.
 
 ## Update Check
 
@@ -552,7 +570,7 @@ Current behavior:
 
 - The app reads the latest release tag and finds the `Resizer3.exe` release asset.
 - It compares the release tag version against the local executable version.
-- If the release version is newer, it shows an update-available message and enables `Update`.
+- If the release version is newer, it shows an update-available message and enables `Update`. `Update` stays disabled while a conversion runs, and `Convert` is disabled while an update downloads.
 - If no newer version is detected, `Update` remains disabled.
 - If the check fails, the error is logged and `Update` remains disabled.
 
@@ -566,11 +584,13 @@ Clicking `Update`:
 5. It copies the updated executable over the original executable.
 6. It relaunches the updated executable.
 
+The updated executable is first copied next to the original as `Resizer3.exe.new` and then renamed over it, so the original is only replaced by a complete file. If the copy or rename keeps failing for about 10 seconds, the updater logs the error, shows it, and relaunches the current version so the app never just disappears.
+
 ## Known Behavior And Caveats
 
 - Output AVIF is not currently exposed, even though AVIF input is accepted.
-- `Output Full Folder Structure` preserves original filename and extension in the output path.
 - Cancellation is cooperative and may not interrupt a native encoder immediately.
 - The failed-file tab appears only after a failure.
-- Very high thread counts can saturate disk, memory bandwidth, native codecs, or the Windows UI message loop.
-- Existing output files with the same name are overwritten.
+- Very high thread counts can saturate disk, memory bandwidth, or native codecs.
+- Existing output files from earlier runs are overwritten, but only after the new file is complete.
+- If Windows shuts down mid-batch, a `.r3tmp.` temporary file may be left next to an output; it can be deleted.

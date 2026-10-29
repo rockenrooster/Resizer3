@@ -1,43 +1,41 @@
-using PhotoSauce.MagicScaler;
-using PhotoSauce.NativeCodecs.Libheif;
-using PhotoSauce.NativeCodecs.Libjxl;
-using PhotoSauce.NativeCodecs.Libwebp;
+using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.Reflection;
-using System.Text;
-using System.Collections.Concurrent;
-using System.Threading;
-using System.Runtime.InteropServices;
-using NetVips;
-//using SixLabors.ImageSharp;
-//using NeoSolve.ImageSharp.AVIF;
-
-
 
 namespace Resizer3
 {
     public partial class Form1 : Form
     {
-
-        private const int FileStreamBufferSize = 128 * 1024;
         private GitHubReleaseUpdate? pendingUpdate;
-        private static readonly HashSet<string> AllowedInputExtensions = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".avif", ".jxl",
-            ".bmp", ".gif", ".tiff", ".ico"
-        };
 
-        private static readonly EnumerationOptions RecursiveFileEnumeration = new()
-        {
-            RecurseSubdirectories = true,
-            IgnoreInaccessible = true,
-            ReturnSpecialDirectories = false,
-            AttributesToSkip = 0
-        };
+        // Contents of the virtual-mode grids.
+        private readonly List<InputFile> inputFiles = new();
+        private readonly HashSet<string> inputPaths = new(StringComparer.OrdinalIgnoreCase);
+        private long inputBytes;
+        private readonly List<FailedFile> failedFiles = new();
 
-        private readonly record struct ConversionItem(string InputPath, string OutputPath, long InputSize);
+        // Workers queue failures; the progress timer moves them into the grid in batches.
+        private readonly ConcurrentQueue<FailedFile> pendingFailures = new();
+
+        // Batch statistics, updated by worker threads.
+        private int succeededCount;
+        private int failedCount;
+        private int totalFilesProcessing;
+        private long processedInputBytes; // input bytes of started files, for MB/s
+        private long succeededInputBytes; // input bytes of converted files, for Saved %
+        private long afterSize;           // output bytes of converted files
+
+        private readonly System.Windows.Forms.Timer progressTimer = new() { Interval = 50 };
+        private int progressTicks;
+        private readonly Stopwatch sw = new();
+        private CancellationTokenSource? cts;
+        private Task?[]? activeWorkers;
+        private bool isProcessing;
+        private bool isUpdating;
+        private bool closeAfterStop;
+        private bool closePromptOpen;
+        private bool failedTabShown;
 
         public Form1()
         {
@@ -46,16 +44,6 @@ namespace Resizer3
             textBox1.Text = @"C:\img";
             numericUpDownRes.Value = 100;
 
-
-
-
-            CodecManager.Configure(codecs =>
-            {
-                codecs.UseLibjxl();
-                codecs.UseLibheif();
-                codecs.UseLibwebp();
-                //codecs.UseLibpng();
-            });
             comboBox1.Items.Clear();
             comboBox1.Items.AddRange(new string[]
             {
@@ -68,12 +56,12 @@ namespace Resizer3
             maxResComboBox.Items.AddRange(new string[] { "Off", "4K (2160p)", "1440p", "1080p" });
             maxResComboBox.SelectedItem = "Off";
 
-            // Load Saved entries
+            // Load saved entries, clamped so an out-of-range value cannot break startup.
             var settings = AppSettings.Load();
             textBox1.Text = settings.SaveLocation;
-            numericUpDownQuality.Value = settings.Quality;
-            numericUpDownThreads.Value = settings.ThreadsNumber > 0 ? settings.ThreadsNumber : Environment.ProcessorCount;
-            numericUpDownRes.Value = settings.Resolution;
+            numericUpDownQuality.Value = ClampNumeric(settings.Quality, numericUpDownQuality.Minimum, numericUpDownQuality.Maximum);
+            numericUpDownThreads.Value = ClampNumeric(settings.ThreadsNumber > 0 ? settings.ThreadsNumber : Environment.ProcessorCount, numericUpDownThreads.Minimum, numericUpDownThreads.Maximum);
+            numericUpDownRes.Value = ClampNumeric(settings.Resolution, numericUpDownRes.Minimum, numericUpDownRes.Maximum);
             if (!string.IsNullOrEmpty(settings.Format))
                 comboBox1.SelectedItem = settings.Format;
             if (!string.IsNullOrEmpty(settings.MaxRes))
@@ -81,35 +69,14 @@ namespace Resizer3
             numericUpDownWebpEffort.Value = ClampNumeric(settings.WebpEffort, numericUpDownWebpEffort.Minimum, numericUpDownWebpEffort.Maximum);
             numericUpDownPngCompression.Value = ClampNumeric(settings.PngCompression, numericUpDownPngCompression.Minimum, numericUpDownPngCompression.Maximum);
 
+            progressTimer.Tick += progressTimer_Tick;
             this.Shown += Form1_Shown;
-            AddRelativePathColumn();
             UpdateFormatOptionsVisibility();
 
             // Remove Failed Files tab initially
             tabControl.TabPages.Remove(tabPageFailedFiles);
         }
 
-        private void AddFailedFile(string filePath, string errorMessage)
-        {
-            // Show Failed Files tab if it's not visible
-            if (!tabControl.TabPages.Contains(tabPageFailedFiles))
-            {
-                tabControl.TabPages.Add(tabPageFailedFiles);
-            }
-
-            // Add failed file to dataGridViewFailed
-            var row = new DataGridViewRow();
-            row.CreateCells(dataGridViewFailed);
-            row.Cells[0].Value = filePath;
-            row.Cells[1].Value = errorMessage;
-            dataGridViewFailed.Rows.Add(row);
-
-            // Switch to Failed Files tab
-            tabControl.SelectedTab = tabPageFailedFiles;
-        }
-
-        private int fileNum;
-        long afterSize = 0;
         private void Form1_Load(object sender, EventArgs e)
         {
             var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0.0";
@@ -123,116 +90,6 @@ namespace Resizer3
             await CheckForUpdateAsync();
 
         }
-        private void AddRelativePathColumn()
-        {
-            if (!dataGridView1.Columns.Contains("RelativePath"))
-            {
-                var relCol = new DataGridViewTextBoxColumn
-                {
-                    Name = "RelativePath",
-                    HeaderText = "RelativePath",
-                    Visible = false // hide it
-                };
-                dataGridView1.Columns.Add(relCol);
-            }
-        }
-
-
-
-        public void SaveAsIco(System.Drawing.Image img, string path)
-        {
-            using (var bmp = new Bitmap(img, new System.Drawing.Size(256, 256)))
-            {
-                // Convert to 32bppArgb
-                using (var bmp32 = new Bitmap(bmp.Width, bmp.Height, PixelFormat.Format32bppArgb))
-                using (Graphics g = Graphics.FromImage(bmp32))
-                {
-                    g.DrawImage(bmp, 0, 0, bmp.Width, bmp.Height);
-
-                    using (var fs = new FileStream(path, FileMode.Create))
-                    using (var bw = new BinaryWriter(fs))
-                    {
-                        // ICO Header
-                        bw.Write((short)0);        // Reserved
-                        bw.Write((short)1);        // Type = 1 for icons
-                        bw.Write((short)1);        // Number of images
-
-                        // Directory entry
-                        bw.Write((byte)0);         // Width 0 = 256
-                        bw.Write((byte)0);         // Height 0 = 256
-                        bw.Write((byte)0);         // Color palette
-                        bw.Write((byte)0);         // Reserved
-                        bw.Write((short)1);        // Color planes
-                        bw.Write((short)32);       // Bits per pixel
-                        int imageDataSize = 40 + bmp32.Width * bmp32.Height * 4; // BITMAPINFOHEADER + pixel data
-                        bw.Write(imageDataSize);   // Size of image data
-                        bw.Write(6 + 16);          // Offset of image data (header + directory)
-
-                        // BITMAPINFOHEADER
-                        bw.Write(40);              // Header size
-                        bw.Write(bmp32.Width);
-                        bw.Write(bmp32.Height * 2); // height = image + mask (ICO format)
-                        bw.Write((short)1);        // Planes
-                        bw.Write((short)32);       // Bits per pixel
-                        bw.Write(0);               // Compression (BI_RGB)
-                        bw.Write(0);               // Image size (can be 0 for BI_RGB)
-                        bw.Write(0);               // X pixels per meter
-                        bw.Write(0);               // Y pixels per meter
-                        bw.Write(0);               // Colors used
-                        bw.Write(0);               // Important colors
-
-                        // Write pixel data (BGRA, bottom-up).  Format32bppArgb is already BGRA in memory.
-                        var rect = new Rectangle(0, 0, bmp32.Width, bmp32.Height);
-                        BitmapData? bits = null;
-                        try
-                        {
-                            bits = bmp32.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                            int stride = bits.Stride;
-                            int absStride = Math.Abs(stride);
-                            int bytesPerRow = bmp32.Width * 4;
-                            byte[] row = new byte[bytesPerRow];
-
-                            for (int y = bmp32.Height - 1; y >= 0; y--)
-                            {
-                                int sourceOffset = stride > 0
-                                    ? y * stride
-                                    : (bmp32.Height - 1 - y) * absStride;
-                                Marshal.Copy(IntPtr.Add(bits.Scan0, sourceOffset), row, 0, bytesPerRow);
-                                bw.Write(row, 0, bytesPerRow);
-                            }
-                        }
-                        finally
-                        {
-                            if (bits != null)
-                                bmp32.UnlockBits(bits);
-                        }
-
-                        // AND mask: can be all zero for 32-bit with alpha
-                        int maskBytesPerRow = (bmp32.Width + 31) / 32 * 4;
-                        for (int y = 0; y < bmp32.Height; y++)
-                            for (int b = 0; b < maskBytesPerRow; b++)
-                                bw.Write((byte)0);
-                    }
-                }
-            }
-        }
-        /*
-        public void SaveAsAvif(string inPath, string outPath, int quality)
-        {
-            int cqLevel = (int)(63 * (100 - quality) / 100m);
-            var encoder = new AVIFEncoder
-            {
-                CQLevel = cqLevel,
-                Lossless = (quality == 100),
-
-            };
-
-            using var image = SixLabors.ImageSharp.Image.Load(inPath);
-
-            image.Save(outPath, encoder);
-        }
-        */
-
 
         private async Task CheckForUpdateAsync()
         {
@@ -247,7 +104,7 @@ namespace Resizer3
                 if (pendingUpdate is not null)
                 {
                     MessageBox.Show($"Update Available: {pendingUpdate.Version}\n(Local version: {localVersion})");
-                    update.Enabled = true;
+                    update.Enabled = !isProcessing;
                 }
             }
             catch (Exception ex)
@@ -265,61 +122,52 @@ namespace Resizer3
 
         private async void dataGridView1_DragDropAsync(object sender, DragEventArgs e)
         {
-            var data = e.Data;
-            if (data == null)
+            string[] droppedItems = e.Data?.GetData(DataFormats.FileDrop, false) as string[] ?? Array.Empty<string>();
+            if (droppedItems.Length == 0)
                 return;
-            string[] droppedItems = data.GetData(DataFormats.FileDrop, false) as string[] ?? Array.Empty<string>();
 
-            List<(string fullPath, string relativePath)> validFiles = await Task.Run(() =>
+            List<InputFile> found;
+            try
             {
-                var allFiles = new List<(string, string)>();
-
-                foreach (var item in droppedItems)
-                {
-                    if (Directory.Exists(item))
-                    {
-                        string topFolderName = Path.GetFileName(item.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-
-                        var filesInDir = Directory.EnumerateFiles(item, "*.*", RecursiveFileEnumeration)
-                                                  .Where(f => AllowedInputExtensions.Contains(Path.GetExtension(f)));
-
-                        foreach (var file in filesInDir)
-                        {
-                            // include top folder in relative path
-                            string relativePath = Path.Combine(topFolderName, Path.GetRelativePath(item, file));
-                            relativePath = relativePath.Replace('/', Path.DirectorySeparatorChar); // normalize separators
-                            allFiles.Add((file, relativePath));
-                        }
-                    }
-                    else if (File.Exists(item))
-                    {
-                        if (AllowedInputExtensions.Contains(Path.GetExtension(item)))
-                            allFiles.Add((item, Path.GetFileName(item)));
-                    }
-                }
-
-                return allFiles;
-            });
-
-            dataGridView1.SuspendLayout();
-            int relColIndex = dataGridView1.Columns["RelativePath"]?.Index ?? -1;
-            foreach (var (fullPath, relativePath) in validFiles)
-            {
-                object[] rowValues = new object[dataGridView1.Columns.Count];
-                rowValues[0] = fullPath;
-                if (relColIndex >= 0)
-                    rowValues[relColIndex] = relativePath;
-                dataGridView1.Rows.Add(rowValues);
+                found = await Task.Run(() => InputCollector.Collect(droppedItems));
             }
-            dataGridView1.ResumeLayout();
+            catch (Exception ex)
+            {
+                AppLog.TryLog("Collect dropped files", ex);
+                MessageBox.Show(this, "Could not read the dropped items: " + ex.Message, "Resizer3", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
-            dataGridView1_Changed();
+            if (!IsDisposed)
+                AddInputFiles(found);
         }
 
+        private void AddInputFiles(List<InputFile> files)
+        {
+            int before = inputFiles.Count;
+            foreach (var file in files)
+            {
+                // Skip files already listed, e.g. when the same folder is dropped twice.
+                if (inputPaths.Add(file.FullPath))
+                {
+                    inputFiles.Add(file);
+                    inputBytes += file.Size;
+                }
+            }
 
+            if (inputFiles.Count != before)
+            {
+                ClearSortGlyphs(dataGridView1);
+                dataGridView1.RowCount = inputFiles.Count;
+            }
+            UpdateInputSummary();
+        }
 
-
-
+        private void UpdateInputSummary()
+        {
+            numFiles.Text = inputFiles.Count.ToString();
+            beforeSizeLabel.Text = ((inputBytes / 1024.000 / 1024.000).ToString("N3") + " MB");
+        }
 
         private void dataGridView1_DragEnter(object sender, DragEventArgs e)
         {
@@ -329,621 +177,259 @@ namespace Resizer3
                 e.Effect = DragDropEffects.None;
         }
 
-        private int comfileNum;
+        private void dataGridView1_CellValueNeeded(object? sender, DataGridViewCellValueEventArgs e)
+        {
+            if ((uint)e.RowIndex < (uint)inputFiles.Count)
+                e.Value = inputFiles[e.RowIndex].FullPath;
+        }
 
-        private readonly ConcurrentDictionary<string, bool> createdDirs = new();
+        private void dataGridViewFailed_CellValueNeeded(object? sender, DataGridViewCellValueEventArgs e)
+        {
+            if ((uint)e.RowIndex >= (uint)failedFiles.Count)
+                return;
 
-        private System.Windows.Forms.Timer? uiUpdateTimer;
-        private System.Windows.Forms.Timer? elapsedTimeTimer;
+            var failed = failedFiles[e.RowIndex];
+            e.Value = e.ColumnIndex == FailedErrorMessage.Index ? failed.ErrorMessage : failed.FilePath;
+        }
 
-        // Processing statistics
-        private long totalBeforeSize = 0; // total input size in bytes
-        private int totalFilesProcessing = 0;
-        private long processedInputBytes = 0; // cumulative input bytes processed
+        private void dataGridView1_ColumnHeaderMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+        {
+            int direction = ToggleSortGlyph(dataGridView1, e.ColumnIndex);
+            inputFiles.Sort((a, b) => direction * string.Compare(a.FullPath, b.FullPath, StringComparison.CurrentCultureIgnoreCase));
+            dataGridView1.Invalidate();
+        }
 
-        public int threads;
-        public int t = 0;
-        public string? format;
-        Stopwatch sw = new Stopwatch();
-        private bool isProcessing = false;
+        private void dataGridViewFailed_ColumnHeaderMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+        {
+            int direction = ToggleSortGlyph(dataGridViewFailed, e.ColumnIndex);
+            bool byMessage = e.ColumnIndex == FailedErrorMessage.Index;
+            failedFiles.Sort((a, b) => direction * string.Compare(
+                byMessage ? a.ErrorMessage : a.FilePath,
+                byMessage ? b.ErrorMessage : b.FilePath,
+                StringComparison.CurrentCultureIgnoreCase));
+            dataGridViewFailed.Invalidate();
+        }
+
+        // Virtual-mode grids cannot sort themselves; the lists behind them are sorted instead.
+        private static int ToggleSortGlyph(DataGridView grid, int columnIndex)
+        {
+            var header = grid.Columns[columnIndex].HeaderCell;
+            var order = header.SortGlyphDirection == SortOrder.Ascending ? SortOrder.Descending : SortOrder.Ascending;
+            ClearSortGlyphs(grid);
+            header.SortGlyphDirection = order;
+            return order == SortOrder.Ascending ? 1 : -1;
+        }
+
+        private static void ClearSortGlyphs(DataGridView grid)
+        {
+            foreach (DataGridViewColumn column in grid.Columns)
+                column.HeaderCell.SortGlyphDirection = SortOrder.None;
+        }
 
         private async void buttonResize_Click(object sender, EventArgs e)
         {
-            if (isProcessing)
+            if (isProcessing || isUpdating)
                 return;
+
+            string outputRoot = textBox1.Text.Trim();
+            if (!Path.IsPathFullyQualified(outputRoot))
+            {
+                MessageBox.Show(this, @"Set Output Path to a full folder path, for example C:\img.", "Resizer3", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Snapshot UI state so workers never touch controls.
+            var options = CaptureOptions(outputRoot);
+            int threads = Decimal.ToInt32(numericUpDownThreads.Value);
+            InputFile[] inputs = inputFiles.ToArray();
+
             isProcessing = true;
+            closeAfterStop = false;
+            failedTabShown = false;
             buttonResize.Enabled = false;
             cancelButton.Enabled = true;
-
-            cts = new();
-            dataGridView1_Changed();
-            sw.Reset();
-            sw.Start();
-
-            afterSize = 0;
-            Interlocked.Exchange(ref processedInputBytes, 0);
-            Interlocked.Exchange(ref totalBeforeSize, 0);
-            totalFilesProcessing = 0;
-            createdDirs.Clear();
-            t = 0;
-            threads = Decimal.ToInt32(numericUpDownThreads.Value);
-            comfileNum = 0;
-            format = "image/" + (comboBox1.SelectedItem?.ToString() ?? "jpg");
-
-            //Thread myThread = new Thread(() => ThreadHandler2Async());
-            //myThread.Start();
+            update.Enabled = false;
             buttonResize.Text = "Converting... 0%";
-            // Start a periodic UI updater (batches UI work to reduce cross-thread overhead)
-            uiUpdateTimer = new System.Windows.Forms.Timer();
-            uiUpdateTimer.Interval = 250;
-            uiUpdateTimer.Tick += (s, ev) => UpdateUI();
-            uiUpdateTimer.Start();
 
-            elapsedTimeTimer = new System.Windows.Forms.Timer();
-            elapsedTimeTimer.Interval = 33;
-            elapsedTimeTimer.Tick += (s, ev) => UpdateElapsedTime();
-            elapsedTimeTimer.Start();
+            succeededCount = 0;
+            failedCount = 0;
+            totalFilesProcessing = 0;
+            processedInputBytes = 0;
+            succeededInputBytes = 0;
+            afterSize = 0;
+            progressTicks = 0;
 
+            var runCts = new CancellationTokenSource();
+            cts = runCts;
+            bool canceled = false;
+            sw.Restart();
+            progressTimer.Start();
             try
             {
-                await ThreadHandler2Async();
+                await RunConversionAsync(inputs, options, threads, runCts);
+                canceled = runCts.IsCancellationRequested;
+            }
+            catch (Exception ex)
+            {
+                AppLog.TryLog("Conversion", ex);
+                if (!closeAfterStop)
+                    MessageBox.Show(this, "Conversion stopped with an error: " + ex.Message, "Resizer3", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
+                sw.Stop();
+                progressTimer.Stop();
+                UpdateElapsedTime();
+                UpdateUI();
+                cts = null;
+                runCts.Dispose();
                 isProcessing = false;
                 buttonResize.Enabled = true;
                 cancelButton.Enabled = false;
+                update.Enabled = pendingUpdate is not null;
                 buttonResize.Text = "Convert";
             }
-            return;
-        }
 
-        private async Task ThreadHandler2Async()
-        {
-            try
-            {
-                // Snapshot UI state to avoid cross-thread access during processing
-                var rows = dataGridView1.Rows.Cast<DataGridViewRow>()
-                    .Where(r => r.Cells.Count > 0 && r.Cells[0].Value != null)
-                    .Select(r => (inPath: r.Cells[0].Value?.ToString() ?? string.Empty, relativePath: r.Cells["RelativePath"].Value?.ToString() ?? string.Empty))
-                    .ToList();
-
-                string outputRoot = textBox1.Text;
-                string formatLocal = format ?? "image/jpg";
-                string formatExtension = GetFormatExtension(formatLocal);
-                bool preserveFullFolderStructure = checkBox1.Checked;
-                int quality = Decimal.ToInt32(numericUpDownQuality.Value);
-                decimal multiplier = numericUpDownRes.Value / 100m;
-                // libvips doesn't support writing .ico directly; use MagicScaler+GDI for ICO.
-                // Some libvips builds omit BMP/GIF save support; use MagicScaler for BMP/GIF as well.
-                bool useLibvips = formatLocal != "image/ico" && formatLocal != "image/bmp" && formatLocal != "image/gif";
-                bool webpLossless = quality == 100;
-                int webpEffort = Decimal.ToInt32(numericUpDownWebpEffort.Value);
-                int pngCompression = Decimal.ToInt32(numericUpDownPngCompression.Value);
-
-                // Capture max resolution dimensions on UI thread before spawning workers
-                var (maxWidth, maxHeight) = GetMaxResolutionDimensions();
-
-                // Filter to existing files and compute totals for progress and throughput
-                var filteredRows = new List<ConversionItem>(rows.Count);
-                long sumBefore = 0;
-                foreach (var r in rows)
-                {
-                    if (string.IsNullOrEmpty(r.inPath) || !File.Exists(r.inPath))
-                        continue;
-
-                    long inputSize = GetFileLength(r.inPath);
-                    sumBefore += inputSize;
-                    string outPath = BuildOutputPath(r.inPath, r.relativePath, outputRoot, formatExtension, preserveFullFolderStructure);
-                    filteredRows.Add(new ConversionItem(r.inPath, outPath, inputSize));
-                }
-
-                totalFilesProcessing = filteredRows.Count;
-                Interlocked.Exchange(ref totalBeforeSize, sumBefore);
-
-                int requestedDegree = threads > 0 ? threads : Environment.ProcessorCount;
-                int maxDegree = Math.Max(1, Math.Min(requestedDegree, Math.Max(1, filteredRows.Count)));
-                if (useLibvips)
-                {
-                    // Split cores between file-level workers and libvips' internal pool
-                    // so small batches of large files still saturate the CPU.
-                    NetVips.NetVips.Concurrency = Math.Max(1, Environment.ProcessorCount / maxDegree);
-                }
-
-                // Workers run CPU-bound loops for the whole batch, so give them dedicated
-                // threads; Task.Run would hold thread-pool threads and ramp up slowly
-                // past the pool's minimum when high thread counts are requested.
-                int nextIndex = -1;
-                var consumers = Enumerable.Range(0, maxDegree).Select(_ => Task.Factory.StartNew(() =>
-                {
-                    while (true)
-                    {
-                        cts.Token.ThrowIfCancellationRequested();
-                        int i = Interlocked.Increment(ref nextIndex);
-                        if (i >= filteredRows.Count)
-                            break;
-
-                        var item = filteredRows[i];
-                        if (useLibvips)
-                        {
-                            ProcessSingleFileLibvips(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, webpLossless, webpEffort, pngCompression, cts.Token);
-                        }
-                        else
-                        {
-                            ProcessSingleFile(item.InputPath, item.OutputPath, item.InputSize, formatLocal, quality, multiplier, maxWidth, maxHeight, cts.Token);
-                        }
-                    }
-                }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
-
-                await Task.WhenAll(consumers);
-
-                sw.Stop();
-                // ensure final UI update and stop timer
-                elapsedTimeTimer?.Stop();
-                uiUpdateTimer?.Stop();
-                UpdateUI();
-                try
-                {
-                    double finalElapsed = sw.Elapsed.TotalSeconds;
-                    string elapsedText = finalElapsed > 0 ? finalElapsed.ToString("N2") + " s" : "0.00 s";
-                    double finalFilesPerSec = finalElapsed > 0 ? comfileNum / finalElapsed : 0.0;
-
-                    // Update summary labels in the main UI instead of showing a MessageBox
-                    elapsedLabel.Text = elapsedText;
-                    filesPerSecLabel.Text = finalFilesPerSec.ToString("N2") + " files/s";
-                    buttonResize.Text = "Convert";
-                }
-                catch { }
-            }
-            catch (OperationCanceledException)
-            {
+            // With a close prompt open, Form1_FormClosing finishes the close when the prompt returns.
+            if (closePromptOpen)
+                return;
+            if (closeAfterStop)
+                Close();
+            else if (canceled)
                 MessageBox.Show("Operation was Cancelled.");
-            }
-            finally
+        }
+
+        private ConversionOptions CaptureOptions(string outputRoot)
+        {
+            var (maxWidth, maxHeight) = GetMaxResolutionDimensions();
+            return new ConversionOptions(
+                OutputRoot: outputRoot,
+                Format: comboBox1.SelectedItem?.ToString() ?? "jpg",
+                PreserveFullFolderStructure: checkBox1.Checked,
+                Quality: Decimal.ToInt32(numericUpDownQuality.Value),
+                Multiplier: numericUpDownRes.Value / 100m,
+                MaxWidth: maxWidth,
+                MaxHeight: maxHeight,
+                WebpEffort: Decimal.ToInt32(numericUpDownWebpEffort.Value),
+                PngCompression: Decimal.ToInt32(numericUpDownPngCompression.Value));
+        }
+
+        private async Task RunConversionAsync(InputFile[] inputs, ConversionOptions options, int threads, CancellationTokenSource runCts)
+        {
+            // Plan output paths off the UI thread. Files whose output would overwrite themselves are
+            // rejected; colliding outputs get a numbered suffix.
+            var rejected = new List<FailedFile>();
+            var (jobs, inputsByName) = await Task.Run(() => (OutputPlanner.Plan(inputs, options, rejected), OutputPlanner.IndexByFileName(inputs)));
+            CancellationToken token = runCts.Token;
+
+            totalFilesProcessing = inputs.Length;
+            foreach (var failed in rejected)
+                pendingFailures.Enqueue(failed);
+            Interlocked.Add(ref failedCount, rejected.Count);
+            if (jobs.Count == 0)
+                return;
+
+            int requestedDegree = threads > 0 ? threads : Environment.ProcessorCount;
+            int maxDegree = Math.Clamp(requestedDegree, 1, jobs.Count);
+            if (options.UseLibvips)
             {
-                sw.Stop();
-                cts.Dispose();
-            }
-        }
-
-        private static string GetFormatExtension(string formatLocal)
-        {
-            int slashIndex = formatLocal.LastIndexOf('/');
-            return slashIndex >= 0 ? formatLocal[(slashIndex + 1)..] : formatLocal;
-        }
-
-        private static long GetFileLength(string path)
-        {
-            try { return new FileInfo(path).Length; }
-            catch { return 0; }
-        }
-
-        private static string BuildOutputPath(string inPath, string relativePath, string outputRoot, string formatExtension, bool preserveFullFolderStructure)
-        {
-            if (preserveFullFolderStructure)
-            {
-                string root = Path.GetPathRoot(inPath) ?? string.Empty;
-                string safeFullPath = !string.IsNullOrEmpty(root) && inPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)
-                    ? inPath[root.Length..]
-                    : inPath;
-                safeFullPath = safeFullPath.Replace(":", "");
-                return Path.Combine(outputRoot, safeFullPath);
+                // Split cores between file-level workers and libvips' internal pool
+                // so small batches of large files still saturate the CPU.
+                NetVips.NetVips.Concurrency = Math.Max(1, Environment.ProcessorCount / maxDegree);
             }
 
-            string relative = string.IsNullOrEmpty(relativePath) ? Path.GetFileName(inPath) : relativePath;
-            string relativeDir = Path.GetDirectoryName(relative) ?? string.Empty;
-            string newFileName = Path.GetFileNameWithoutExtension(relative) + "." + formatExtension;
-
-            return string.IsNullOrEmpty(relativeDir)
-                ? Path.Combine(outputRoot, newFileName)
-                : Path.Combine(outputRoot, relativeDir, newFileName);
-        }
-
-        private static (int width, int height) CalculateTargetDimensions(int imgWidth, int imgHeight, decimal multiplier, int maxWidth, int maxHeight)
-        {
-            if (imgWidth <= 0 || imgHeight <= 0)
-                return (0, 0);
-
-            if (maxWidth != int.MaxValue)
-            {
-                if (imgWidth <= maxWidth && imgHeight <= maxHeight)
-                    return (imgWidth, imgHeight);
-
-                double widthRatio = (double)maxWidth / imgWidth;
-                double heightRatio = (double)maxHeight / imgHeight;
-                double scale = Math.Min(widthRatio, heightRatio);
-                return (Math.Max(1, (int)(imgWidth * scale)), Math.Max(1, (int)(imgHeight * scale)));
-            }
-
-            return (Math.Max(1, (int)(imgWidth * multiplier)), Math.Max(1, (int)(imgHeight * multiplier)));
-        }
-
-        private void EnsureOutputDirectory(string outPath)
-        {
-            string? dir = Path.GetDirectoryName(outPath);
-            if (!string.IsNullOrEmpty(dir))
-            {
-                createdDirs.GetOrAdd(dir, static directory =>
-                {
-                    Directory.CreateDirectory(directory);
-                    return true;
-                });
-            }
-        }
-
-        private void ReportFailure(string filePath, string errorMessage)
-        {
+            // Workers run CPU-bound loops for the whole batch, so give them dedicated
+            // threads; Task.Run would hold thread-pool threads and ramp up slowly
+            // past the pool's minimum when high thread counts are requested.
+            // Cancellation is checked between files, so no output is left half-written.
+            var createdDirs = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            int nextIndex = -1;
+            var consumers = new Task?[maxDegree];
+            activeWorkers = consumers;
             try
             {
-                if (IsDisposed || !IsHandleCreated)
-                    return;
-
-                if (InvokeRequired)
-                    BeginInvoke((System.Windows.Forms.MethodInvoker)(() => AddFailedFile(filePath, errorMessage)));
-                else
-                    AddFailedFile(filePath, errorMessage);
-            }
-            catch { }
-        }
-
-        private static DateTime GetDesiredTimestamp(string inPath, bool tryExifDateTaken)
-        {
-            if (tryExifDateTaken)
-            {
-                try
-                {
-                    using var stream = new FileStream(inPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileStreamBufferSize, FileOptions.SequentialScan);
-                    using var image = System.Drawing.Image.FromStream(stream, useEmbeddedColorManagement: false, validateImageData: false);
-                    if (TryGetExifDateTaken(image, out DateTime dateTaken))
-                        return dateTaken;
-                }
-                catch { }
-            }
-
-            try { return File.GetLastWriteTime(inPath); }
-            catch { return DateTime.Now; }
-        }
-
-        private static bool TryGetExifDateTaken(System.Drawing.Image image, out DateTime dateTaken)
-        {
-            const int ExifDateTakenPropertyId = 36867;
-            dateTaken = default;
-
-            try
-            {
-                if (image.PropertyIdList?.Contains(ExifDateTakenPropertyId) != true)
-                    return false;
-
-                var propItem = image.GetPropertyItem(ExifDateTakenPropertyId);
-                if (propItem?.Value == null)
-                    return false;
-
-                string rawDate = Encoding.UTF8.GetString(propItem.Value).Trim('\0', ' ', '\t', '\r', '\n');
-                return DateTime.TryParseExact(rawDate, "yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out dateTaken);
+                for (int w = 0; w < maxDegree; w++)
+                    consumers[w] = StartWorker();
             }
             catch
             {
-                return false;
+                // Could not start every worker (e.g. too many threads): stop the running ones before reporting.
+                runCts.Cancel();
+                await Task.WhenAll(consumers.OfType<Task>());
+                activeWorkers = null;
+                throw;
             }
-        }
-
-        private static void TrySetOutputTimestamp(string outPath, DateTime desiredTime, CancellationToken token, bool retry)
-        {
-            int attempts = retry ? 8 : 1;
-            for (int attempt = 0; attempt < attempts; attempt++)
-            {
-                token.ThrowIfCancellationRequested();
-                try
-                {
-                    File.SetLastWriteTime(outPath, desiredTime);
-                    return;
-                }
-                catch (IOException) when (retry) { }
-                catch (UnauthorizedAccessException) when (retry) { }
-                catch { return; }
-
-                Thread.Sleep(50);
-            }
-        }
-
-        private static long GetOutputFileLength(string outPath, CancellationToken token, bool retry)
-        {
-            int attempts = retry ? 8 : 1;
-            for (int attempt = 0; attempt < attempts; attempt++)
-            {
-                token.ThrowIfCancellationRequested();
-                try
-                {
-                    var fi = new FileInfo(outPath);
-                    if (fi.Exists && fi.Length > 0)
-                        return fi.Length;
-                }
-                catch { }
-
-                if (retry)
-                    Thread.Sleep(30);
-            }
-
-            try { return new FileInfo(outPath).Length; }
-            catch { return 0; }
-        }
-
-        private void SaveIcoWithMagicScaler(string inPath, string outPath, CancellationToken token)
-        {
-            using var bmpStream = new MemoryStream();
-            var bmpSettings = new ProcessImageSettings { Width = 256, Height = 256 };
-            bmpSettings.TrySetEncoderFormat("image/bmp");
-
-            MagicImageProcessor.ProcessImage(inPath, bmpStream, bmpSettings);
-            token.ThrowIfCancellationRequested();
-
-            bmpStream.Position = 0;
-            using var tempImg = new Bitmap(bmpStream);
-            SaveAsIco(tempImg, outPath);
-        }
-
-        private void ProcessSingleFile(string inPath, string outPath, long inputSize, string formatLocal, int quality, decimal multiplier, int maxWidth, int maxHeight, CancellationToken token)
-        {
-            if (string.IsNullOrEmpty(inPath))
-                return;
-            token.ThrowIfCancellationRequested();
 
             try
             {
-                token.ThrowIfCancellationRequested();
-                Interlocked.Add(ref processedInputBytes, inputSize);
-                int imgWidth = 0, imgHeight = 0;
+                await Task.WhenAll(consumers.OfType<Task>());
+            }
+            finally
+            {
+                activeWorkers = null;
+            }
 
-                try
+            Task StartWorker() =>
+                Task.Factory.StartNew(() =>
                 {
-                    var info = ImageFileInfo.Load(inPath);
-                    if (info.Frames.Count > 0)
+                    using var worker = new ConversionWorker(options, createdDirs, inputsByName);
+                    while (!token.IsCancellationRequested)
                     {
-                        imgWidth = info.Frames[0].Width;
-                        imgHeight = info.Frames[0].Height;
-                    }
-                }
-                catch
-                {
-                    // Fall back below.
-                }
+                        int i = Interlocked.Increment(ref nextIndex);
+                        if (i >= jobs.Count)
+                            break;
 
-                if (imgWidth == 0 || imgHeight == 0)
-                {
-                    try
-                    {
-                        using var vipsInfo = NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential);
-                        imgWidth = vipsInfo.Width;
-                        imgHeight = vipsInfo.Height;
-                    }
-                    catch { }
-                }
-
-                var (targetWidth, targetHeight) = CalculateTargetDimensions(imgWidth, imgHeight, multiplier, maxWidth, maxHeight);
-
-                var resizeSettings = new ProcessImageSettings
-                {
-                    Width = targetWidth,
-                    Height = targetHeight
-                };
-
-                // FORMAT-SPECIFIC ENCODER OPTIONS
-                if (formatLocal == "image/webp")
-                {
-                    resizeSettings.EncoderOptions = quality >= 100 ? new WebpLosslessEncoderOptions() : new WebpLossyEncoderOptions { Quality = quality };
-                }
-                else if (formatLocal != "image/ico")
-                {
-                    resizeSettings.EncoderOptions = new LossyEncoderOptions { Quality = quality };
-                }
-
-                resizeSettings.TrySetEncoderFormat(formatLocal);
-
-                // Write output
-                try
-                {
-                    token.ThrowIfCancellationRequested();
-                    EnsureOutputDirectory(outPath);
-
-                    if (formatLocal == "image/ico")
-                    {
-                        SaveIcoWithMagicScaler(inPath, outPath, token);
-                    }
-                    else
-                    {
-                        using (var outStream = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, FileStreamBufferSize))
+                        var job = jobs[i];
+                        Interlocked.Add(ref processedInputBytes, job.InputSize);
+                        var result = worker.Process(job, token);
+                        if (result.Status == FileStatus.Succeeded)
                         {
-                            MagicImageProcessor.ProcessImage(inPath, outStream, resizeSettings);
+                            Interlocked.Add(ref succeededInputBytes, job.InputSize);
+                            Interlocked.Add(ref afterSize, result.OutputBytes);
+                            Interlocked.Increment(ref succeededCount);
+                        }
+                        else if (result.Status == FileStatus.Failed)
+                        {
+                            pendingFailures.Enqueue(new FailedFile(job.InputPath, result.Error ?? "Unknown error"));
+                            Interlocked.Increment(ref failedCount);
                         }
                     }
-                }
-                catch (Exception ex)
-                {
-                    ReportFailure(inPath, ex.Message + ": Error writing " + outPath);
-                    return;
-                }
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
 
-                DateTime desiredTime = GetDesiredTimestamp(inPath, tryExifDateTaken: true);
-                TrySetOutputTimestamp(outPath, desiredTime, token, retry: true);
-                long added = GetOutputFileLength(outPath, token, retry: true);
-
-                Interlocked.Increment(ref comfileNum);
-                Interlocked.Add(ref afterSize, added);
-
-                // UI updates handled by the periodic timer.
-            }
-            catch (OperationCanceledException)
-            {
+        private void WaitForWorkers(TimeSpan timeout)
+        {
+            if (activeWorkers is not { } workers)
                 return;
+            try
+            {
+                Task.WaitAll(workers.OfType<Task>().ToArray(), timeout);
             }
             catch (Exception ex)
             {
-                ReportFailure(inPath, ex.Message);
+                AppLog.TryLog("WaitForWorkers", ex);
             }
         }
 
-        private void ProcessSingleFileLibvips(string inPath, string outPath, long inputSize, string formatLocal, int quality, decimal multiplier, int maxWidth, int maxHeight, bool webpLossless, int webpEffort, int pngCompression, CancellationToken token)
+        private void progressTimer_Tick(object? sender, EventArgs e)
         {
-            if (string.IsNullOrEmpty(inPath))
-                return;
-            token.ThrowIfCancellationRequested();
-
-            string ext = GetFormatExtension(formatLocal).ToLowerInvariant();
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                // Try TurboJPEG fast-path for no-resize JPEG -> JPEG
-                if ((ext == "jpg" || ext == "jpeg") &&
-                    TryTurboJpegFastPath(inPath, outPath, quality, multiplier, maxWidth, maxHeight, out long fastInputSize, out long outputSize))
-                {
-                    try { Interlocked.Add(ref processedInputBytes, fastInputSize); } catch { }
-                    Interlocked.Increment(ref comfileNum);
-                    Interlocked.Add(ref afterSize, outputSize);
-                    return;
-                }
-
-                Interlocked.Add(ref processedInputBytes, inputSize);
-
-                // Header-only probe for dimensions - pixels are not decoded until pulled
-                int imgWidth, imgHeight;
-                using (var probe = NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential))
-                {
-                    imgWidth = probe.Width;
-                    imgHeight = probe.Height;
-                }
-
-                var (targetWidth, targetHeight) = CalculateTargetDimensions(imgWidth, imgHeight, multiplier, maxWidth, maxHeight);
-
-                token.ThrowIfCancellationRequested();
-                // File-based Thumbnail enables shrink-on-load (scaled JPEG/WebP decode,
-                // HEIF thumbnails); ThumbnailImage on an open image cannot use those.
-                using var processedImage = (targetWidth != imgWidth || targetHeight != imgHeight)
-                    ? NetVips.Image.Thumbnail(inPath, targetWidth, height: targetHeight, size: Enums.Size.Down)
-                    : NetVips.Image.NewFromFile(inPath, access: Enums.Access.Sequential);
-
-                // Ensure output directory exists
-                EnsureOutputDirectory(outPath);
-
-                token.ThrowIfCancellationRequested();
-                switch (ext)
-                {
-                    case "webp":
-                        processedImage.Webpsave(outPath, q: quality, lossless: webpLossless, effort: webpEffort);
-                        break;
-                    case "jpg":
-                    case "jpeg":
-                        processedImage.Jpegsave(outPath, q: quality);
-                        break;
-                    case "png":
-                        processedImage.Pngsave(outPath, compression: pngCompression);
-                        break;
-                    case "bmp":
-                        processedImage.WriteToFile(outPath);
-                        break;
-                    case "tiff":
-                    case "tif":
-                        processedImage.Tiffsave(outPath);
-                        break;
-                    case "gif":
-                        processedImage.Gifsave(outPath);
-                        break;
-                    default:
-                        // Fallback to default write
-                        processedImage.WriteToFile(outPath);
-                        break;
-                }
-
-                // Preserve Date Taken metadata - simplified (no blocking retries)
-                DateTime desiredTime = GetDesiredTimestamp(inPath, tryExifDateTaken: false);
-                TrySetOutputTimestamp(outPath, desiredTime, token, retry: false);
-
-                // Get file length - simplified (no blocking retries)
-                long added = GetOutputFileLength(outPath, token, retry: false);
-
-                Interlocked.Increment(ref comfileNum);
-                Interlocked.Add(ref afterSize, added);
-
-                // UI updates handled by the periodic timer.
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                ReportFailure(inPath, $"libvips error: {ex.Message}");
-            }
-        }
-
-
-
-
-
-
-        public void Convert(string inPath, string outPath, ProcessImageSettings Settings, System.Drawing.Image myImage)
-        {
-            EnsureOutputDirectory(outPath);
-
-            try
-            {
-                /*
-                if (format == "image/avif")
-                {
-                    SaveAsAvif(inPath, outPath, Decimal.ToInt32(numericUpDownQuality.Value));
-                }
-                */
-                if (format == "image/ico")
-                {
-                    SaveAsIco(myImage, outPath);
-                }
-                else
-                {
-                    using (var outStream = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None, FileStreamBufferSize))
-                    {
-                        MagicImageProcessor.ProcessImage(inPath, outStream, Settings);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Task.Run(() =>
-                {
-                    MessageBox.Show(ex.Message + ": Error writing " + outPath);
-                });
-            }
-
-            DateTime desiredTime = TryGetExifDateTaken(myImage, out DateTime dateTaken)
-                ? dateTaken
-                : GetDesiredTimestamp(inPath, tryExifDateTaken: false);
-            TrySetOutputTimestamp(outPath, desiredTime, CancellationToken.None, retry: false);
-
-            // Update counters atomically; UI will be refreshed by the periodic updater.
-            try
-            {
-                Interlocked.Increment(ref comfileNum);
-                long len = 0;
-                try { len = new FileInfo(outPath).Length; } catch { len = 0; }
-                Interlocked.Add(ref afterSize, len);
-            }
-            catch { }
-
-            //Thread updateCompletedLabelThread = new Thread(() => updateCompletedLabel(comfileNum));
-            //updateCompletedLabelThread.Start();
-
-            t--;
-            //Dispose();
-            myImage.Dispose();
+            UpdateElapsedTime();
+            // Stats and failures refresh every 250 ms so the numbers stay readable.
+            if (++progressTicks % 5 == 0)
+                UpdateUI();
         }
 
         private async void update_Click(object sender, EventArgs e)
         {
-            if (pendingUpdate is null)
+            if (pendingUpdate is null || isProcessing || isUpdating)
                 return;
 
             var appDir = Path.GetDirectoryName(Application.ExecutablePath) ?? Environment.CurrentDirectory;
             string updatedPath = Path.Combine(appDir, "Resizer3Updated.exe");
             Version localVersion = GetFileVersion(Application.ExecutablePath);
+            isUpdating = true;
             update.Enabled = false;
+            buttonResize.Enabled = false;
 
             try
             {
@@ -971,64 +457,72 @@ namespace Resizer3
             catch (Exception ex)
             {
                 MessageBox.Show("Update failed: " + ex.Message);
+                isUpdating = false;
                 update.Enabled = pendingUpdate is not null;
+                buttonResize.Enabled = true;
             }
         }
 
         private void UpdateElapsedTime()
         {
-            try
-            {
-                double elapsed = sw.Elapsed.TotalSeconds;
-                string elapsedText = elapsed > 0 ? elapsed.ToString("N2") + " s" : "0.00 s";
-                elapsedLabel.Text = elapsedText;
-            }
-            catch { }
+            double elapsed = sw.Elapsed.TotalSeconds;
+            elapsedLabel.Text = elapsed > 0 ? elapsed.ToString("N2") + " s" : "0.00 s";
         }
 
         private void UpdateUI()
         {
-            if (InvokeRequired)
-            {
-                BeginInvoke((System.Windows.Forms.MethodInvoker)delegate { UpdateUI(); });
-                return;
-            }
-            try
-            {
-                var completed = Interlocked.CompareExchange(ref comfileNum, 0, 0);
-                var size = Interlocked.Read(ref afterSize);
-                double elapsed = sw.Elapsed.TotalSeconds;
-                double filesPerSec = elapsed > 0 ? completed / elapsed : 0.0;
-                double mbSec = elapsed > 0 ? (Interlocked.Read(ref processedInputBytes) / 1024.0 / 1024.0) / elapsed : 0.0;
-                double inBytes = Interlocked.Read(ref totalBeforeSize);
-                double saved = inBytes > 0 ? 100.0 * (1.0 - (double)size / inBytes) : 0.0;
-                int pct = totalFilesProcessing > 0 ? (int)(completed * 100L / totalFilesProcessing) : 0;
-                completedFiles.Text = completed.ToString();
-                afterSizeLabel.Text = ((size / 1024.000 / 1024.000).ToString("N3") + " MB");
-                filesPerSecLabel.Text = filesPerSec.ToString("N2") + " files/s";
-                mbPerSecLabel.Text = mbSec.ToString("N2") + " MB/s";
-                percentSavedLabel.Text = saved.ToString("N2") + "%";
-                processingProgress.Value = Math.Max(0, Math.Min(100, pct));
-                if (isProcessing)
-                {
-                    buttonResize.Text = $"Converting... {pct}%";
-                }
-            }
-            catch { }
+            DrainFailures();
+
+            int succeeded = Volatile.Read(ref succeededCount);
+            int failed = Volatile.Read(ref failedCount);
+            long size = Interlocked.Read(ref afterSize);
+            long convertedInput = Interlocked.Read(ref succeededInputBytes);
+            double elapsed = sw.Elapsed.TotalSeconds;
+            double filesPerSec = elapsed > 0 ? succeeded / elapsed : 0.0;
+            double mbSec = elapsed > 0 ? (Interlocked.Read(ref processedInputBytes) / 1024.0 / 1024.0) / elapsed : 0.0;
+            // Compare outputs with the inputs that produced them, so failures do not inflate the figure.
+            double saved = convertedInput > 0 ? 100.0 * (1.0 - (double)size / convertedInput) : 0.0;
+            int total = totalFilesProcessing;
+            int pct = total > 0 ? (int)((succeeded + failed) * 100L / total) : 0;
+
+            completedFiles.Text = failed > 0 ? $"{succeeded} ({failed} failed)" : succeeded.ToString();
+            afterSizeLabel.Text = ((size / 1024.000 / 1024.000).ToString("N3") + " MB");
+            filesPerSecLabel.Text = filesPerSec.ToString("N2") + " files/s";
+            mbPerSecLabel.Text = mbSec.ToString("N2") + " MB/s";
+            percentSavedLabel.Text = saved.ToString("N2") + "%";
+            processingProgress.Value = Math.Clamp(pct, 0, 100);
+            if (isProcessing && cts?.IsCancellationRequested == false)
+                buttonResize.Text = $"Converting... {pct}%";
         }
-        CancellationTokenSource cts = new();
+
+        private void DrainFailures()
+        {
+            if (pendingFailures.IsEmpty)
+                return;
+
+            while (pendingFailures.TryDequeue(out var failed))
+                failedFiles.Add(failed);
+            ClearSortGlyphs(dataGridViewFailed);
+            dataGridViewFailed.RowCount = failedFiles.Count;
+
+            // Show the Failed Files tab, switching to it once per batch.
+            if (!tabControl.TabPages.Contains(tabPageFailedFiles))
+                tabControl.TabPages.Add(tabPageFailedFiles);
+            if (!failedTabShown)
+            {
+                failedTabShown = true;
+                tabControl.SelectedTab = tabPageFailedFiles;
+            }
+        }
+
         private void cancelButton_Click(object sender, EventArgs e)
         {
-            if (!isProcessing)
+            if (!isProcessing || cts is null)
                 return;
-            try
-            {
-                if (!cts.IsCancellationRequested)
-                    cts.Cancel();
-                buttonResize.Text = "Cancelling...";
-                cancelButton.Enabled = false;
-            }
-            catch (ObjectDisposedException) { }
+
+            cts.Cancel();
+            buttonResize.Text = "Cancelling...";
+            cancelButton.Enabled = false;
         }
 
         private void button1_Click(object sender, EventArgs e)
@@ -1049,16 +543,52 @@ namespace Resizer3
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (isProcessing && e.CloseReason is (CloseReason.WindowsShutDown or CloseReason.TaskManagerClosing))
+            {
+                // No prompt here; give the files in progress a moment so fewer temp files are left behind.
+                cts?.Cancel();
+                WaitForWorkers(TimeSpan.FromSeconds(3));
+            }
+            else if (isProcessing)
+            {
+                // Workers stop between files, so nothing is left half-written; close once they are done.
+                // Closing again while they finish offers to leave at once, in case a file is stuck on a slow drive.
+                string question = closeAfterStop
+                    ? "Files are still finishing. Close now anyway? Files in progress will not be saved."
+                    : "A conversion is still running. Stop it and close Resizer?";
+                closePromptOpen = true;
+                bool yes = MessageBox.Show(this, question, "Resizer3", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+                closePromptOpen = false;
+
+                if (!isProcessing)
+                {
+                    // The batch ended while the prompt was open; close unless the user declined both times.
+                    if (!yes && !closeAfterStop)
+                    {
+                        e.Cancel = true;
+                        return;
+                    }
+                }
+                else if (!yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                else if (!closeAfterStop)
+                {
+                    e.Cancel = true;
+                    closeAfterStop = true;
+                    cts?.Cancel();
+                    buttonResize.Text = "Cancelling...";
+                    cancelButton.Enabled = false;
+                    return;
+                }
+            }
+
             try
             {
-                // Stop timers early to reduce shutdown-time surprises.
-                try { uiUpdateTimer?.Stop(); } catch (Exception ex) { AppLog.TryLog("Form1_FormClosing.uiUpdateTimer.Stop", ex); }
-                try { uiUpdateTimer?.Dispose(); } catch (Exception ex) { AppLog.TryLog("Form1_FormClosing.uiUpdateTimer.Dispose", ex); }
-                uiUpdateTimer = null;
-
-                try { elapsedTimeTimer?.Stop(); } catch (Exception ex) { AppLog.TryLog("Form1_FormClosing.elapsedTimeTimer.Stop", ex); }
-                try { elapsedTimeTimer?.Dispose(); } catch (Exception ex) { AppLog.TryLog("Form1_FormClosing.elapsedTimeTimer.Dispose", ex); }
-                elapsedTimeTimer = null;
+                progressTimer.Stop();
 
                 var settings = new AppSettings
                 {
@@ -1092,65 +622,13 @@ namespace Resizer3
             }
         }
 
-        private int fileSizeRefreshVersion;
-
-        private async void dataGridView1_Changed()
-        {
-            // Compute file sizes off the UI thread to avoid blocking the UI for large lists.
-            int refreshVersion = Interlocked.Increment(ref fileSizeRefreshVersion);
-            var paths = new List<string>();
-            for (int i = 0; i < dataGridView1.Rows.Count; i++)
-            {
-                var val = dataGridView1.Rows[i].Cells[0].Value;
-                var s = val?.ToString();
-                if (!string.IsNullOrEmpty(s))
-                    paths.Add(s);
-            }
-            int visibleFileCount = paths.Count;
-
-            long beforeSize = await Task.Run(() =>
-            {
-                long sum = 0;
-                foreach (var p in paths)
-                {
-                    sum += GetFileLength(p);
-                }
-                return sum;
-            });
-
-            if (refreshVersion != Volatile.Read(ref fileSizeRefreshVersion) || IsDisposed || !IsHandleCreated)
-                return;
-
-            fileNum = visibleFileCount;
-            try
-            {
-                BeginInvoke((System.Windows.Forms.MethodInvoker)(() =>
-                {
-                    if (refreshVersion != Volatile.Read(ref fileSizeRefreshVersion))
-                        return;
-
-                    numFiles.Text = fileNum.ToString();
-                    beforeSizeLabel.Text = ((beforeSize / 1024.000 / 1024.000).ToString("N3") + " MB");
-                }));
-            }
-            catch { }
-        }
-
-        private void dataGridView1_MouseLeave(object sender, EventArgs e)
-        {
-            dataGridView1_Changed();
-        }
-
         private void dataGridViewFailed_DoubleClick(object sender, EventArgs e)
         {
-            if (dataGridViewFailed.CurrentRow == null)
+            int index = dataGridViewFailed.CurrentRow?.Index ?? -1;
+            if ((uint)index >= (uint)failedFiles.Count)
                 return;
 
-            var cellValue = dataGridViewFailed.CurrentRow.Cells[0].Value;
-            if (cellValue == null)
-                return;
-
-            string filePath = cellValue.ToString() ?? string.Empty;
+            string filePath = failedFiles[index].FilePath;
             if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
                 return;
 
@@ -1209,511 +687,20 @@ namespace Resizer3
             numericUpDownPngCompression.Visible = showPng;
         }
 
-        private static decimal ClampNumeric(int value, decimal min, decimal max)
-        {
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
-        }
-
-        private bool TryTurboJpegFastPath(string inPath, string outPath, int quality, decimal multiplier, int maxWidth, int maxHeight, out long inputSize, out long outputSize)
-        {
-            inputSize = 0;
-            outputSize = 0;
-            if (!TurboJpegNative.IsAvailable)
-                return false;
-
-            if (multiplier != 1m && maxWidth == int.MaxValue)
-                return false;
-
-            byte[] jpegData;
-            int width, height, subsamp, colorspace;
-            try
-            {
-                using var fs = new FileStream(inPath, FileMode.Open, FileAccess.Read, FileShare.Read, FileStreamBufferSize, FileOptions.SequentialScan);
-                long fileLength = fs.Length;
-                if (fileLength <= 0 || fileLength > int.MaxValue)
-                    return false;
-
-                // Parse the header from a small prefix (growing if SOF sits past large
-                // EXIF/ICC segments) so images that fall through to libvips are not
-                // fully read into memory twice.
-                int filled = (int)Math.Min(fileLength, 128 * 1024);
-                byte[] buffer = new byte[filled];
-                fs.ReadExactly(buffer, 0, filled);
-
-                while (!TurboJpegNative.TryGetHeader(buffer, filled, out width, out height, out subsamp, out colorspace))
-                {
-                    if (filled >= fileLength)
-                        return false;
-
-                    int grownLength = (int)Math.Min(fileLength, (long)filled * 16);
-                    byte[] grown = new byte[grownLength];
-                    Buffer.BlockCopy(buffer, 0, grown, 0, filled);
-                    fs.ReadExactly(grown, filled, grownLength - filled);
-                    buffer = grown;
-                    filled = grownLength;
-                }
-
-                bool noResize = maxWidth == int.MaxValue
-                    ? multiplier == 1m
-                    : (width <= maxWidth && height <= maxHeight);
-                if (!noResize)
-                    return false;
-
-                if (filled < fileLength)
-                {
-                    byte[] full = new byte[fileLength];
-                    Buffer.BlockCopy(buffer, 0, full, 0, filled);
-                    fs.ReadExactly(full, filled, (int)fileLength - filled);
-                    jpegData = full;
-                }
-                else
-                {
-                    jpegData = buffer;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-
-            inputSize = jpegData.LongLength;
-
-            byte[]? icc = JpegIcc.TryExtract(jpegData);
-
-            if (!TurboJpegNative.TryTranscode(jpegData, width, height, subsamp, colorspace, quality, out byte[] output))
-                return false;
-
-            if (icc != null && icc.Length > 0)
-            {
-                if (!JpegIcc.TryInsert(output, icc, out byte[] withIcc))
-                    return false;
-                output = withIcc;
-            }
-
-            if (output.Length == 0)
-                return false;
-
-            EnsureOutputDirectory(outPath);
-
-            File.WriteAllBytes(outPath, output);
-            outputSize = output.LongLength;
-
-            DateTime desiredTime = File.GetLastWriteTime(inPath);
-            try { File.SetLastWriteTime(outPath, desiredTime); } catch { }
-
-            return true;
-        }
-
-        private static class TurboJpegNative
-        {
-            private const string DllName = "turbojpeg";
-            private const int TJCS_GRAY = 2;
-            private const int TJCS_CMYK = 3;
-            private const int TJCS_YCCK = 4;
-
-            private const int TJPF_RGB = 0;
-            private const int TJPF_GRAY = 6;
-
-            private const int TJSAMP_GRAY = 3;
-
-            private static readonly ThreadLocal<IntPtr> s_decompress = new(() => IntPtr.Zero);
-            private static readonly ThreadLocal<IntPtr> s_compress = new(() => IntPtr.Zero);
-
-            internal static readonly bool IsAvailable = CheckAvailable();
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern IntPtr tjInitDecompress();
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern IntPtr tjInitCompress();
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjDestroy(IntPtr handle);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjDecompressHeader3(IntPtr handle, byte[] jpegBuf, int jpegSize, out int width, out int height, out int subsamp, out int colorspace);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjDecompress2(IntPtr handle, byte[] jpegBuf, int jpegSize, IntPtr dstBuf, int width, int pitch, int height, int pixelFormat, int flags);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjCompress2(IntPtr handle, IntPtr srcBuf, int width, int pitch, int height, int pixelFormat, ref IntPtr jpegBuf, ref uint jpegSize, int jpegSubsamp, int jpegQual, int flags);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjDecompressToYUV2(IntPtr handle, byte[] jpegBuf, int jpegSize, IntPtr dstBuf, int width, int padding, int height, int flags);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern int tjCompressFromYUV(IntPtr handle, IntPtr srcBuf, int width, int padding, int height, int jpegSubsamp, ref IntPtr jpegBuf, ref uint jpegSize, int jpegQual, int flags);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern ulong tjBufSizeYUV2(int width, int padding, int height, int jpegSubsamp);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern IntPtr tjAlloc(nint bytes);
-
-            [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-            private static extern void tjFree(IntPtr buffer);
-
-            private static bool CheckAvailable()
-            {
-                try
-                {
-                    IntPtr handle = tjInitDecompress();
-                    if (handle == IntPtr.Zero)
-                        return false;
-                    tjDestroy(handle);
-                    return true;
-                }
-                catch (DllNotFoundException)
-                {
-                    return false;
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    return false;
-                }
-                catch (BadImageFormatException)
-                {
-                    return false;
-                }
-            }
-
-            private static IntPtr GetDecompressHandle()
-            {
-                if (!IsAvailable)
-                    return IntPtr.Zero;
-                IntPtr handle = s_decompress.Value;
-                if (handle == IntPtr.Zero)
-                {
-                    handle = tjInitDecompress();
-                    s_decompress.Value = handle;
-                }
-                return handle;
-            }
-
-            private static IntPtr GetCompressHandle()
-            {
-                if (!IsAvailable)
-                    return IntPtr.Zero;
-                IntPtr handle = s_compress.Value;
-                if (handle == IntPtr.Zero)
-                {
-                    handle = tjInitCompress();
-                    s_compress.Value = handle;
-                }
-                return handle;
-            }
-
-            internal static bool TryGetHeader(byte[] jpegData, int length, out int width, out int height, out int subsamp, out int colorspace)
-            {
-                width = 0;
-                height = 0;
-                subsamp = 0;
-                colorspace = 0;
-                IntPtr handle = GetDecompressHandle();
-                if (handle == IntPtr.Zero)
-                    return false;
-                return tjDecompressHeader3(handle, jpegData, length, out width, out height, out subsamp, out colorspace) == 0;
-            }
-
-            internal static bool TryTranscode(byte[] jpegData, int width, int height, int subsamp, int colorspace, int quality, out byte[] output)
-            {
-                if (TryTranscodeYuv(jpegData, width, height, subsamp, colorspace, quality, out output))
-                    return true;
-                return TryTranscodeRgb(jpegData, width, height, subsamp, colorspace, quality, out output);
-            }
-
-            private static bool TryTranscodeYuv(byte[] jpegData, int width, int height, int subsamp, int colorspace, int quality, out byte[] output)
-            {
-                output = Array.Empty<byte>();
-                try
-                {
-                    IntPtr dec = GetDecompressHandle();
-                    IntPtr comp = GetCompressHandle();
-                    if (dec == IntPtr.Zero || comp == IntPtr.Zero)
-                        return false;
-
-                    if (colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
-                        return false;
-
-                    const int padding = 1;
-                    ulong yuvSize = tjBufSizeYUV2(width, padding, height, subsamp);
-                    if (yuvSize == 0 || yuvSize > int.MaxValue)
-                        return false;
-
-                    IntPtr yuvBuf = tjAlloc((nint)yuvSize);
-                    if (yuvBuf == IntPtr.Zero)
-                        return false;
-
-                    try
-                    {
-                        if (tjDecompressToYUV2(dec, jpegData, jpegData.Length, yuvBuf, width, padding, height, 0) != 0)
-                            return false;
-
-                        IntPtr outBuf = IntPtr.Zero;
-                        uint outSize = 0;
-                        if (tjCompressFromYUV(comp, yuvBuf, width, padding, height, subsamp, ref outBuf, ref outSize, quality, 0) != 0)
-                            return false;
-
-                        try
-                        {
-                            if (outSize == 0 || outSize > int.MaxValue)
-                                return false;
-                            byte[] managed = new byte[outSize];
-                            Marshal.Copy(outBuf, managed, 0, (int)outSize);
-                            output = managed;
-                            return true;
-                        }
-                        finally
-                        {
-                            if (outBuf != IntPtr.Zero)
-                                tjFree(outBuf);
-                        }
-                    }
-                    finally
-                    {
-                        tjFree(yuvBuf);
-                    }
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    return false;
-                }
-                catch (DllNotFoundException)
-                {
-                    return false;
-                }
-                catch (BadImageFormatException)
-                {
-                    return false;
-                }
-            }
-
-            private static bool TryTranscodeRgb(byte[] jpegData, int width, int height, int subsamp, int colorspace, int quality, out byte[] output)
-            {
-                output = Array.Empty<byte>();
-                IntPtr dec = GetDecompressHandle();
-                IntPtr comp = GetCompressHandle();
-                if (dec == IntPtr.Zero || comp == IntPtr.Zero)
-                    return false;
-
-                if (colorspace == TJCS_CMYK || colorspace == TJCS_YCCK)
-                    return false;
-
-                int pixelFormat = colorspace == TJCS_GRAY ? TJPF_GRAY : TJPF_RGB;
-                int channels = colorspace == TJCS_GRAY ? 1 : 3;
-                long bufSize = (long)width * height * channels;
-                if (bufSize <= 0 || bufSize > int.MaxValue)
-                    return false;
-
-                IntPtr rgbBuf = tjAlloc((nint)bufSize);
-                if (rgbBuf == IntPtr.Zero)
-                    return false;
-
-                try
-                {
-                    int pitch = width * channels;
-                    if (tjDecompress2(dec, jpegData, jpegData.Length, rgbBuf, width, pitch, height, pixelFormat, 0) != 0)
-                        return false;
-
-                    IntPtr outBuf = IntPtr.Zero;
-                    uint outSize = 0;
-                    int outSubsamp = colorspace == TJCS_GRAY ? TJSAMP_GRAY : subsamp;
-                    if (tjCompress2(comp, rgbBuf, width, pitch, height, pixelFormat, ref outBuf, ref outSize, outSubsamp, quality, 0) != 0)
-                        return false;
-
-                    try
-                    {
-                        if (outSize == 0 || outSize > int.MaxValue)
-                            return false;
-                        byte[] managed = new byte[outSize];
-                        Marshal.Copy(outBuf, managed, 0, (int)outSize);
-                        output = managed;
-                        return true;
-                    }
-                    finally
-                    {
-                        if (outBuf != IntPtr.Zero)
-                            tjFree(outBuf);
-                    }
-                }
-                finally
-                {
-                    tjFree(rgbBuf);
-                }
-            }
-        }
-
-        private static class JpegIcc
-        {
-            private const byte MarkerPrefix = 0xFF;
-            private const byte SOI = 0xD8;
-            private const byte SOS = 0xDA;
-            private const byte EOI = 0xD9;
-            private const byte APP2 = 0xE2;
-            private const int IccOverheadLen = 14;
-            private const int IccMaxBytesInMarker = 65533 - IccOverheadLen;
-            private static readonly byte[] IccId = Encoding.ASCII.GetBytes("ICC_PROFILE");
-
-            internal static byte[]? TryExtract(byte[] jpeg)
-            {
-                if (jpeg.Length < 4 || jpeg[0] != MarkerPrefix || jpeg[1] != SOI)
-                    return null;
-
-                int index = 2;
-                int? totalSegments = null;
-                var segments = new Dictionary<int, byte[]>();
-
-                while (index + 1 < jpeg.Length)
-                {
-                    if (jpeg[index] != MarkerPrefix)
-                    {
-                        index++;
-                        continue;
-                    }
-
-                    while (index < jpeg.Length && jpeg[index] == MarkerPrefix)
-                        index++;
-                    if (index >= jpeg.Length)
-                        break;
-
-                    byte marker = jpeg[index++];
-                    if (marker == SOS || marker == EOI)
-                        break;
-
-                    if (index + 1 >= jpeg.Length)
-                        break;
-
-                    int length = (jpeg[index] << 8) | jpeg[index + 1];
-                    if (length < 2 || index + length > jpeg.Length)
-                        break;
-
-                    int payloadStart = index + 2;
-                    int payloadLength = length - 2;
-
-                    if (marker == APP2 && payloadLength >= IccOverheadLen)
-                    {
-                        if (IsIccMarker(jpeg, payloadStart, payloadLength, out int seq, out int total))
-                        {
-                            int dataOffset = payloadStart + IccOverheadLen;
-                            int dataLen = payloadLength - IccOverheadLen;
-                            if (dataLen > 0)
-                            {
-                                byte[] chunk = new byte[dataLen];
-                                Buffer.BlockCopy(jpeg, dataOffset, chunk, 0, dataLen);
-                                segments[seq] = chunk;
-                                totalSegments ??= total;
-                            }
-                        }
-                    }
-
-                    index += length;
-                }
-
-                if (segments.Count == 0 || totalSegments is null)
-                    return null;
-
-                int totalCount = totalSegments.Value;
-                for (int i = 1; i <= totalCount; i++)
-                {
-                    if (!segments.ContainsKey(i))
-                        return null;
-                }
-
-                int totalSize = segments.Values.Sum(s => s.Length);
-                byte[] icc = new byte[totalSize];
-                int offset = 0;
-                for (int i = 1; i <= totalCount; i++)
-                {
-                    byte[] chunk = segments[i];
-                    Buffer.BlockCopy(chunk, 0, icc, offset, chunk.Length);
-                    offset += chunk.Length;
-                }
-
-                return icc;
-            }
-
-            internal static bool TryInsert(byte[] jpeg, byte[] icc, out byte[] output)
-            {
-                output = Array.Empty<byte>();
-                if (jpeg.Length < 2 || icc.Length == 0)
-                    return false;
-                if (jpeg[0] != MarkerPrefix || jpeg[1] != SOI)
-                    return false;
-
-                int numSegments = (icc.Length + IccMaxBytesInMarker - 1) / IccMaxBytesInMarker;
-                int extra = numSegments * (2 + 2 + IccOverheadLen) + icc.Length;
-                int newSize = jpeg.Length + extra;
-                if (newSize <= 0)
-                    return false;
-
-                byte[] outBuf = new byte[newSize];
-                int insertPos = 2;
-                Buffer.BlockCopy(jpeg, 0, outBuf, 0, insertPos);
-                int outPos = insertPos;
-                int offset = 0;
-
-                for (int seg = 0; seg < numSegments; seg++)
-                {
-                    int chunk = icc.Length - offset;
-                    if (chunk > IccMaxBytesInMarker)
-                        chunk = IccMaxBytesInMarker;
-
-                    outBuf[outPos++] = MarkerPrefix;
-                    outBuf[outPos++] = APP2;
-                    int length = IccOverheadLen + chunk + 2;
-                    outBuf[outPos++] = (byte)((length >> 8) & 0xFF);
-                    outBuf[outPos++] = (byte)(length & 0xFF);
-
-                    Buffer.BlockCopy(IccId, 0, outBuf, outPos, IccId.Length);
-                    outPos += IccId.Length;
-                    outBuf[outPos++] = 0;
-                    outBuf[outPos++] = (byte)(seg + 1);
-                    outBuf[outPos++] = (byte)numSegments;
-
-                    Buffer.BlockCopy(icc, offset, outBuf, outPos, chunk);
-                    outPos += chunk;
-                    offset += chunk;
-                }
-
-                Buffer.BlockCopy(jpeg, insertPos, outBuf, outPos, jpeg.Length - insertPos);
-                output = outBuf;
-                return true;
-            }
-
-            private static bool IsIccMarker(byte[] data, int start, int length, out int seq, out int total)
-            {
-                seq = 0;
-                total = 0;
-                if (length < IccOverheadLen)
-                    return false;
-
-                for (int i = 0; i < IccId.Length; i++)
-                {
-                    if (data[start + i] != IccId[i])
-                        return false;
-                }
-                if (data[start + IccId.Length] != 0)
-                    return false;
-
-                seq = data[start + IccId.Length + 1];
-                total = data[start + IccId.Length + 2];
-                if (seq <= 0 || total <= 0)
-                    return false;
-                return true;
-            }
-        }
+        private static decimal ClampNumeric(decimal value, decimal min, decimal max) => Math.Clamp(value, min, max);
 
         private void clearListButton_Click(object sender, EventArgs e)
         {
-            dataGridView1.Rows.Clear();
-            dataGridViewFailed.Rows.Clear();
-            numFiles.Text = "0";
+            inputFiles.Clear();
+            inputPaths.Clear();
+            inputBytes = 0;
+            dataGridView1.RowCount = 0;
+            failedFiles.Clear();
+            dataGridViewFailed.RowCount = 0;
+            ClearSortGlyphs(dataGridView1);
+            ClearSortGlyphs(dataGridViewFailed);
+            UpdateInputSummary();
             completedFiles.Text = "0";
-            beforeSizeLabel.Text = "0 MB";
-            fileNum = 0;
 
             // Remove Failed Files tab
             tabControl.TabPages.Remove(tabPageFailedFiles);

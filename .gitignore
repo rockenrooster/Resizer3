@@ -4,7 +4,6 @@ bin/
 obj/
 artifacts/
 publish/
-
 *.user
 *.suo
 *.userosscache
@@ -12,7 +11,6 @@ publish/
 *.binlog
 build_log.txt
 *.log
-
 Resizer3.exe
 *.zip
 release.ps1

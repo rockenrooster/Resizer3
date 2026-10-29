@@ -5,6 +5,11 @@ namespace Resizer3
 {
     internal static class AppLog
     {
+        // When the log passes this size it becomes Resizer3.old.log, so it never grows without bound.
+        private const long MaxLogBytes = 1024 * 1024;
+
+        private static readonly object Gate = new();
+
         private static string LogDir =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Resizer3");
 
@@ -14,10 +19,16 @@ namespace Resizer3
         {
             try
             {
-                Directory.CreateDirectory(LogDir);
                 var line =
                     $"{DateTime.UtcNow:O} | {context}{Environment.NewLine}{ex}{Environment.NewLine}{Environment.NewLine}";
-                File.AppendAllText(LogPath, line);
+                lock (Gate)
+                {
+                    Directory.CreateDirectory(LogDir);
+                    var info = new FileInfo(LogPath);
+                    if (info.Exists && info.Length > MaxLogBytes)
+                        File.Move(LogPath, Path.Combine(LogDir, "Resizer3.old.log"), overwrite: true);
+                    File.AppendAllText(LogPath, line);
+                }
             }
             catch
             {
@@ -26,4 +37,3 @@ namespace Resizer3
         }
     }
 }
-

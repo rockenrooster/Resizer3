@@ -81,27 +81,58 @@ namespace Resizer3
 
         static void ReplaceAndRelaunch(string sourcePath, string targetPath, bool cleanupSource)
         {
+            // Copy beside the target, then swap it in with a rename, so a failed copy can never
+            // leave a half-written executable to relaunch.
+            string stagedPath = targetPath + ".new";
+            Exception? copyError = Retry(() => File.Copy(sourcePath, stagedPath, overwrite: true))
+                ?? Retry(() => File.Move(stagedPath, targetPath, overwrite: true));
+
+            // On failure the target is still the old version; relaunch it so the app never just disappears.
+            if (copyError is not null)
+            {
+                try { File.Delete(stagedPath); }
+                catch { }
+                AppLog.TryLog("Updater: could not replace " + targetPath, copyError);
+                MessageBox.Show("The update could not be installed, so the current version will start again.\n\n" + copyError.Message,
+                    "Resizer3 update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = targetPath,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                AppLog.TryLog("Updater: could not relaunch " + targetPath, ex);
+                MessageBox.Show("Could not restart Resizer3: " + ex.Message, "Resizer3 update", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+            if (cleanupSource)
+                ScheduleCleanup(sourcePath);
+        }
+
+        // Retries for about 10 seconds while the old process releases the file; returns the last error.
+        static Exception? Retry(Action action)
+        {
+            Exception? lastError = null;
             for (int i = 0; i < 40; i++)
             {
                 try
                 {
-                    File.Copy(sourcePath, targetPath, overwrite: true);
-                    break;
+                    action();
+                    return null;
                 }
-                catch when (i < 39)
+                catch (Exception ex)
                 {
+                    lastError = ex;
                     Thread.Sleep(250);
                 }
             }
-
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = targetPath,
-                UseShellExecute = true
-            });
-
-            if (cleanupSource)
-                ScheduleCleanup(sourcePath);
+            return lastError;
         }
 
         static string? GetArg(string[] args, string name)

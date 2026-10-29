@@ -26,6 +26,7 @@ Resizer3 accepts files with these extensions when they are dropped directly or d
 
 - `.jpg`
 - `.jpeg`
+- `.jfif`
 - `.png`
 - `.heic`
 - `.heif`
@@ -34,6 +35,7 @@ Resizer3 accepts files with these extensions when they are dropped directly or d
 - `.jxl`
 - `.bmp`
 - `.gif`
+- `.tif`
 - `.tiff`
 - `.ico`
 

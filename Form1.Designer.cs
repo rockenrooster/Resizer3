@@ -139,12 +139,15 @@ namespace Resizer3
             dataGridView1.Margin = new Padding(0);
             dataGridView1.MinimumSize = new Size(65, 48);
             dataGridView1.Name = "dataGridView1";
+            dataGridView1.ReadOnly = true;
             dataGridView1.RowHeadersWidth = 25;
             dataGridView1.Size = new Size(546, 458);
             dataGridView1.TabIndex = 0;
+            dataGridView1.VirtualMode = true;
+            dataGridView1.CellValueNeeded += dataGridView1_CellValueNeeded;
+            dataGridView1.ColumnHeaderMouseClick += dataGridView1_ColumnHeaderMouseClick;
             dataGridView1.DragDrop += dataGridView1_DragDropAsync;
             dataGridView1.DragEnter += dataGridView1_DragEnter;
-            dataGridView1.MouseLeave += dataGridView1_MouseLeave;
             // 
             // dataGridViewFailed
             // 
@@ -162,30 +165,37 @@ namespace Resizer3
             dataGridViewFailed.RowHeadersWidth = 25;
             dataGridViewFailed.Size = new Size(546, 458);
             dataGridViewFailed.TabIndex = 1;
+            dataGridViewFailed.VirtualMode = true;
+            dataGridViewFailed.CellValueNeeded += dataGridViewFailed_CellValueNeeded;
+            dataGridViewFailed.ColumnHeaderMouseClick += dataGridViewFailed_ColumnHeaderMouseClick;
             dataGridViewFailed.DoubleClick += dataGridViewFailed_DoubleClick;
-            // 
+            //
             // FailedFilePath
-            // 
+            //
             FailedFilePath.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
             FailedFilePath.DataPropertyName = "FilePath";
             FailedFilePath.HeaderText = "File Path";
             FailedFilePath.Name = "FailedFilePath";
             FailedFilePath.ReadOnly = true;
-            // 
+            FailedFilePath.SortMode = DataGridViewColumnSortMode.Programmatic;
+            //
             // FailedErrorMessage
-            // 
+            //
             FailedErrorMessage.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
             FailedErrorMessage.DataPropertyName = "ErrorMessage";
             FailedErrorMessage.HeaderText = "Error Message";
             FailedErrorMessage.Name = "FailedErrorMessage";
             FailedErrorMessage.ReadOnly = true;
-            // 
+            FailedErrorMessage.SortMode = DataGridViewColumnSortMode.Programmatic;
+            //
             // InputFiles
-            // 
+            //
             InputFiles.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
             InputFiles.DataPropertyName = "InputFiles";
             InputFiles.HeaderText = "InputFiles               (Drag and Drop)";
             InputFiles.Name = "InputFiles";
+            InputFiles.ReadOnly = true;
+            InputFiles.SortMode = DataGridViewColumnSortMode.Programmatic;
             // 
             // clearListButton
             // 
@@ -347,6 +357,7 @@ namespace Resizer3
             // cancelButton
             // 
             cancelButton.Anchor = AnchorStyles.Bottom;
+            cancelButton.Enabled = false;
             cancelButton.Location = new Point(4, 384);
             cancelButton.Margin = new Padding(4, 3, 4, 3);
             cancelButton.Name = "cancelButton";
@@ -563,6 +574,7 @@ namespace Resizer3
             // 
             comboBox1.Anchor = AnchorStyles.Bottom;
             comboBox1.AutoCompleteCustomSource.AddRange(new string[] { "jpg", "png", "webp" });
+            comboBox1.DropDownStyle = ComboBoxStyle.DropDownList;
             comboBox1.FormattingEnabled = true;
             comboBox1.Items.AddRange(new object[] { "jpg", "png", "webp" });
             comboBox1.Location = new Point(78, 224);
